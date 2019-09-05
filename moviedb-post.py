@@ -11,7 +11,7 @@ def lambda_handler(event, context):
     
     table = dynamodb.Table('movies')
     
-    movie = requests.get("http://www.omdbapi.com/?apikey=" + OMDB + "&t=" + event["queryStringParameters"]["movie"] + "&y=" + event["queryStringParameters"]["year"])
+    movie = requests.get("https://www.omdbapi.com/?apikey=" + OMDB + "&t=" + event["queryStringParameters"]["movie"] + "&y=" + event["queryStringParameters"]["year"])
     
     if movie.json()["Response"] == "True":
         out = {}
@@ -32,14 +32,20 @@ def lambda_handler(event, context):
         
         return {
         'statusCode': 200,
+        'body' : out["title"]
+        }
+    elif movie.json()["Response"] == "False" and movie.json()["Error"] == "Daily request limit reached!":
+        return{
+            'statusCode': 429,
+            'body': "OMDB API request limit reached!"
+        }
+    elif movie.json()["Response"] == "False" and movie.json()["Error"] == "Movie not found!":
+        return{
+            'statusCode': 404,
+            'body': "Movie Not Found!"
         }
     else:
-        return {
-            'statusCode': 500,
-            "error": movie.json()['Error']
-            
+        return{
+            'statusCode': 520,
+            'body': "Unknown Error!"
         }
-    
-    
-    
-    
