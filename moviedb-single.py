@@ -1,6 +1,6 @@
 import json
 import boto3
-from botocore.vendored import requests
+import requests
 import os
 from boto3.dynamodb.conditions import Key, Attr
 
@@ -17,31 +17,15 @@ def lambda_handler(event, context):
 
     table = dynamodb.Table("movies")
 
-    movie = requests.get(
-        "https://www.omdbapi.com/?apikey="
-        + OMDB
-        + "&t="
-        + event["queryStringParameters"]["title"]
-        + "&y="
-        + event["queryStringParameters"]["year"]
+    items = table.get_item(
+        Key={
+            "title": event["queryStringParameters"]["title"],
+            "year": event["queryStringParameters"]["year"],
+        }
     )
 
-    if movie.json()["Response"] == "True":
-
+    if "Item" in items:
         # get item from database
-        items = table.get_item(
-            Key={"title": movie.json()["Title"], "year": movie.json()["Year"]}
-        )
         return {"statusCode": 200, "body": json.dumps(items["Item"])}
-    elif (
-        movie.json()["Response"] == "False"
-        and movie.json()["Error"] == "Daily request limit reached!"
-    ):
-        return {"statusCode": 429, "body": "OMDB API request limit reached!"}
-    elif (
-        movie.json()["Response"] == "False"
-        and movie.json()["Error"] == "Movie not found!"
-    ):
-        return {"statusCode": 404, "body": "Movie Not Found!"}
     else:
-        return {"statusCode": 520, "body": "Unknown Error!"}
+        return {"statusCode": 404, "body": "Movie Not Found!"}

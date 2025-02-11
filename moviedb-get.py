@@ -8,8 +8,8 @@ def lambda_handler(event, context):
     table = dynamodb.Table('movies')
     
     response = table.scan()
-    
-    items = []    
+
+    items = []
     
     for i in response['Items']:
         items.append(i)

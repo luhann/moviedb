@@ -1,6 +1,6 @@
 import json
 import boto3
-from botocore.vendored import requests
+import requests
 import os
 from boto3.dynamodb.conditions import Key, Attr
 
@@ -11,7 +11,7 @@ def lambda_handler(event, context):
     
     table = dynamodb.Table('movies')
     
-    movie = requests.get("https://www.omdbapi.com/?apikey=" + OMDB + "&t=" + event["queryStringParameters"]["movie"] + "&y=" + event["queryStringParameters"]["year"])
+    movie = requests.get("https://www.omdbapi.com/?apikey=" + OMDB + "&t=" + event["queryStringParameters"]["title"] + "&y=" + event["queryStringParameters"]["year"])
     
     if movie.json()["Response"] == "True":
         out = {}
