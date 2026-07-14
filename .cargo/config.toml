@@ -1,0 +1,24 @@
+[build]
+target = "x86_64-unknown-linux-musl"
+
+# sqlite3.c is compiled by the host clang against glibc headers (no musl
+# sysroot installed). SQLite's default LFS defines make glibc redirect
+# lstat/open/mmap to their *64 variants, which musl doesn't export.
+# Disabling LFS is a no-op on x86_64 (off_t is already 64-bit everywhere).
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_DISABLE_LFS"
+
+# Statically link the C runtime for MUSL targets. At the time of writing (2026-06-01), this is
+# the default. But the plan is for the default to change to dynamic linking.
+# The whole point of MUSL with respect to ripgrep is to create a fully
+# statically linked executable.
+#
+# See: https://github.com/rust-lang/compiler-team/issues/422
+# See: https://github.com/rust-lang/compiler-team/issues/422#issuecomment-812135847
+[target.x86_64-unknown-linux-musl]
+linker = "clang"
+rustflags = [
+  "-Z", "threads=8",
+  "-C", "target-feature=+crt-static",
+  "-C", "link-self-contained=yes",
+]
