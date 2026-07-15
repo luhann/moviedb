@@ -10,9 +10,16 @@ PVE_HOST="${PVE_HOST:-root@pve.lan}"
 VMID="${VMID:-210}"
 BIN="target/x86_64-unknown-linux-musl/release/moviedb"
 
+# VMID is interpolated into the remote ssh command below unquoted; reject
+# anything that isn't a plain integer before it gets anywhere near a shell.
+[[ "$VMID" =~ ^[0-9]+$ ]] || {
+    echo "ABORT: VMID must be numeric, got: $VMID" >&2
+    exit 1
+}
+
 cd "$(dirname "$0")/.."
 
-cargo build --release
+cargo build --release --locked
 file "$BIN" | grep -q 'static-pie linked' || {
     echo "ABORT: $BIN is not static-pie linked — wrong toolchain/config?" >&2
     exit 1
