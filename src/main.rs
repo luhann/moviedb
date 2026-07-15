@@ -20,14 +20,17 @@ use std::process::exit;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::{Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use bytes::Bytes;
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
+use futures_util::stream;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -53,12 +56,27 @@ fn utcnow() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
+/// busy_timeout and synchronous reset per-connection (unlike journal_mode,
+/// which is sticky in the DB file itself) — serve and refresh are separate
+/// processes/connections, so both must set these independently.
+fn set_connection_pragmas(db: &Connection) -> rusqlite::Result<()> {
+    // SQLite's default busy_timeout of 0 turns any write collision between
+    // the two processes into an instant SQLITE_BUSY. Writers hold the lock
+    // ~1ms; retry up to 5s.
+    db.busy_timeout(Duration::from_secs(5))?;
+    // Under WAL (see journal_mode below), NORMAL skips the fsync that FULL
+    // does on every commit — still crash-safe against corruption, the only
+    // risk is losing the last commit or two on an OS crash / power loss.
+    // An acceptable trade for a personal, backed-up movie tracker.
+    db.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(())
+}
+
 fn init_db(path: &str) -> rusqlite::Result<Connection> {
     let db = Connection::open(path)?;
-    // busy_timeout is per-connection: serve and refresh are separate processes
-    // writing the same DB, and SQLite's default of 0 turns a write collision
-    // into an instant SQLITE_BUSY. Writers hold the lock ~1ms; retry up to 5s.
-    db.busy_timeout(Duration::from_secs(5))?;
+    // WAL first: synchronous=NORMAL's meaning depends on journal_mode.
+    db.pragma_update(None, "journal_mode", "WAL")?;
+    set_connection_pragmas(&db)?;
     db.execute(
         "
         CREATE TABLE IF NOT EXISTS movies (
@@ -87,7 +105,6 @@ fn init_db(path: &str) -> rusqlite::Result<Connection> {
         ",
         [],
     )?;
-    db.pragma_update(None, "journal_mode", "WAL")?;
     Ok(db)
 }
 
@@ -327,23 +344,31 @@ async fn list_movies(State(state): State<Arc<AppState>>) -> Response {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect()
     })();
+    drop(conn);
     let raw = match result {
         Ok(raw) => raw,
         Err(e) => return internal_error(format!("failed to list movies: {e}")),
     };
-    // Each row is already a valid JSON object (we wrote it); splice the raw
-    // bytes into an array instead of parsing every row into a `Value` tree
-    // and re-serializing the whole table on every GET /.
-    let mut body = String::with_capacity(raw.iter().map(String::len).sum::<usize>() + raw.len() + 2);
-    body.push('[');
-    for (i, doc) in raw.iter().enumerate() {
-        if i > 0 {
-            body.push(',');
-        }
-        body.push_str(doc);
-    }
-    body.push(']');
-    raw_json(body)
+    // Each row is already a valid JSON object (we wrote it); stream the raw
+    // bytes as array elements instead of parsing every row into a `Value`
+    // tree, or even concatenating them into one contiguous buffer, before
+    // the response can start going out.
+    let n = raw.len();
+    let chunks = std::iter::once(Bytes::from_static(b"["))
+        .chain(raw.into_iter().enumerate().map(move |(i, doc)| {
+            let mut buf = doc.into_bytes();
+            if i + 1 < n {
+                buf.push(b',');
+            }
+            Bytes::from(buf)
+        }))
+        .chain(std::iter::once(Bytes::from_static(b"]")))
+        .map(Ok::<_, std::convert::Infallible>);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from_stream(stream::iter(chunks)),
+    )
+        .into_response()
 }
 
 async fn get_single(State(state): State<Arc<AppState>>, Query(p): Query<LookupParams>) -> Response {
@@ -512,9 +537,9 @@ async fn refresh(db_path: String, limit: Option<i64>, sleep_secs: f64, dry_run: 
     };
     // Deliberately a plain open, not init_db: a typo'd db_path should fail at
     // the first SELECT, not silently create an empty schema and "refresh" it.
-    // busy_timeout is per-connection, so it needs setting here too (see init_db).
-    if let Err(e) = db.busy_timeout(Duration::from_secs(5)) {
-        eprintln!("failed to set busy_timeout: {e}");
+    // Pragmas are per-connection though, so they still need setting here too.
+    if let Err(e) = set_connection_pragmas(&db) {
+        eprintln!("failed to set connection pragmas: {e}");
         exit(1);
     }
     let rows_result = (|| -> rusqlite::Result<Vec<(String, String)>> {
