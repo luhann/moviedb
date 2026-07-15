@@ -734,8 +734,10 @@ name = "moviedb"
 version = "1.0.1"
 dependencies = [
  "axum",
+ "bytes",
  "chrono",
  "clap",
+ "futures-util",
  "reqwest",
  "rusqlite",
  "serde",
