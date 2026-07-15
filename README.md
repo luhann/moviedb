@@ -1,4 +1,4 @@
-# moviedb — self-hosted Lambda/DynamoDB replacement
+# moviedb
 
 This is a replacement of my old moviedb lambda REST API. I am self-hosting it
 on my proxmox server. It is a single static Rust binary + SQLite, replacing the three Lambdas. 

@@ -1,0 +1,12 @@
+[Unit]
+Description=Monthly moviedb OMDB refresh
+
+[Timer]
+OnCalendar=monthly
+# Catch up if the LXC was down at the scheduled moment
+Persistent=true
+# Don't hit OMDB at exactly midnight on the 1st like everyone else's cron
+RandomizedDelaySec=6h
+
+[Install]
+WantedBy=timers.target
