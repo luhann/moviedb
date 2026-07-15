@@ -70,7 +70,16 @@ systemctl status moviedb
 systemd-analyze security moviedb   # exposure score; expect ~1.x
 ```
 
-Upgrades are the same push + `systemctl restart moviedb`.
+Upgrades are the same push + `systemctl restart moviedb`. `scripts/deploy.sh`
+does the whole upgrade from the workstation (build, smoke test, push via the
+Proxmox host, restart, verify); set `PVE_HOST`/`VMID` if the defaults
+(`root@pve.lan`, 210) don't match. If pushing manually:
+
+```bash
+# --perms matters: pct push defaults to 0644 root:root on EVERY push,
+# so an upgrade push without it strips the exec bit -> systemd 203/EXEC
+pct push 210 target/x86_64-unknown-linux-musl/release/moviedb /opt/moviedb/moviedb --perms 0755
+```
 
 ## Migrate the DynamoDB data
 

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -53,8 +53,12 @@ fn utcnow() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
-fn init_db(path: &str) -> rusqlite::Result<()> {
+fn init_db(path: &str) -> rusqlite::Result<Connection> {
     let db = Connection::open(path)?;
+    // busy_timeout is per-connection: serve and refresh are separate processes
+    // writing the same DB, and SQLite's default of 0 turns a write collision
+    // into an instant SQLITE_BUSY. Writers hold the lock ~1ms; retry up to 5s.
+    db.busy_timeout(Duration::from_secs(5))?;
     db.execute(
         "
         CREATE TABLE IF NOT EXISTS movies (
@@ -84,7 +88,7 @@ fn init_db(path: &str) -> rusqlite::Result<()> {
         [],
     )?;
     db.pragma_update(None, "journal_mode", "WAL")?;
-    Ok(())
+    Ok(db)
 }
 
 fn ratings_entry_field<'a>(entry: &'a Value, key: &str) -> &'a str {
@@ -123,8 +127,20 @@ fn detail(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "detail": msg }))).into_response()
 }
 
-fn internal_error() -> Response {
+/// Every caller passes a context string describing what failed, printed to
+/// stderr (captured by journalctl) before the generic 500 goes out — without
+/// this, every internal error looked identical in the logs.
+fn internal_error(context: impl std::fmt::Display) -> Response {
+    eprintln!("{context}");
     detail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+}
+
+/// Send `body` as-is with an `application/json` content type, skipping the
+/// parse-then-reserialize round trip: `data` columns only ever hold JSON we
+/// wrote ourselves (via `serde_json::to_string`), so re-parsing into a
+/// `Value` tree just to immediately re-serialize it is pure waste.
+fn raw_json(body: String) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 /// Constant-time byte comparison: if lengths differ fail, else XOR-fold.
@@ -199,7 +215,7 @@ fn resolve_movie(
             "Provide imdbid, or title and year",
         )));
     };
-    row.map_err(|_| Box::new(internal_error()))
+    row.map_err(|e| Box::new(internal_error(format!("resolve_movie query failed: {e}"))))
 }
 
 async fn add_movie(State(state): State<Arc<AppState>>, Query(p): Query<AddParams>) -> Response {
@@ -215,16 +231,19 @@ async fn add_movie(State(state): State<Arc<AppState>>, Query(p): Query<AddParams
         .await
     {
         Ok(r) => r,
-        Err(_) => return internal_error(),
+        Err(e) => return internal_error(format!("OMDB request failed: {e}")),
     };
     let movie: Value = match resp.json().await {
         Ok(v) => v,
-        Err(_) => return internal_error(),
+        Err(e) => return internal_error(format!("OMDB response JSON parse failed: {e}")),
     };
 
     if movie.get("Response").and_then(Value::as_str) == Some("True") {
-        let Some(obj) = movie.as_object() else {
-            return internal_error();
+        // Consume `movie` (rather than borrow+clone every field) — it's not
+        // read again on this path, so moving each value into `out` skips a
+        // clone of every OMDB field (Plot, Actors, Poster, ...) per request.
+        let Value::Object(obj) = movie else {
+            return internal_error("OMDB response was not a JSON object");
         };
         // Lowercase every key, in the original order (Map preserves insertion
         // order via the preserve_order feature — required so stored JSON key
@@ -232,11 +251,14 @@ async fn add_movie(State(state): State<Arc<AppState>>, Query(p): Query<AddParams
         let mut out = Map::new();
         for (key, value) in obj {
             if key == "Ratings" {
-                let mut ratings = value.as_array().cloned().unwrap_or_default();
+                let mut ratings = match value {
+                    Value::Array(a) => a,
+                    _ => Vec::new(),
+                };
                 ratings.push(personal_entry(&p.rating));
                 out.insert("ratings".to_string(), Value::Array(ratings));
             } else {
-                out.insert(key.to_lowercase(), value.clone());
+                out.insert(key.to_lowercase(), value);
             }
         }
         if !out.contains_key("ratings") {
@@ -250,21 +272,22 @@ async fn add_movie(State(state): State<Arc<AppState>>, Query(p): Query<AddParams
         out.shift_remove("response");
 
         let Some(imdbid) = out.get("imdbid").and_then(Value::as_str).map(String::from) else {
-            return internal_error(); // Python: KeyError -> 500
+            return internal_error("OMDB response missing imdbID"); // Python: KeyError -> 500
         };
         let Some(title) = out.get("title").and_then(Value::as_str).map(String::from) else {
-            return internal_error(); // Python: KeyError -> 500
+            return internal_error("OMDB response missing Title"); // Python: KeyError -> 500
         };
-        let ratings = out
+        // Borrowed, not cloned: `out` outlives this (through serialization
+        // below), and snapshot_ratings only needs a &[Value].
+        let ratings: &[Value] = out
             .get("ratings")
             .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+            .map_or(&[][..], Vec::as_slice);
 
         let now = utcnow();
         let data = match serde_json::to_string(&out) {
             Ok(s) => s,
-            Err(_) => return internal_error(),
+            Err(e) => return internal_error(format!("failed to serialize movie doc: {e}")),
         };
         // Single transaction: upsert + history snapshot.
         let mut conn = state.db.lock().unwrap();
@@ -274,11 +297,11 @@ async fn add_movie(State(state): State<Arc<AppState>>, Query(p): Query<AddParams
                 "INSERT OR REPLACE INTO movies (imdb_id, data) VALUES (?, ?)",
                 params![imdbid, data],
             )?;
-            snapshot_ratings(&tx, &imdbid, &title, &ratings, &now)?;
+            snapshot_ratings(&tx, &imdbid, &title, ratings, &now)?;
             tx.commit()
         })();
-        if result.is_err() {
-            return internal_error();
+        if let Err(e) = result {
+            return internal_error(format!("failed to write movie {imdbid}: {e}"));
         }
         // Python: PlainTextResponse(out["title"]) — 200, text/plain.
         return (StatusCode::OK, title).into_response();
@@ -305,17 +328,22 @@ async fn list_movies(State(state): State<Arc<AppState>>) -> Response {
         rows.collect()
     })();
     let raw = match result {
-        Ok(rows) => rows,
-        Err(_) => return internal_error(),
+        Ok(raw) => raw,
+        Err(e) => return internal_error(format!("failed to list movies: {e}")),
     };
-    let mut docs: Vec<Value> = Vec::with_capacity(raw.len());
-    for data in raw {
-        match serde_json::from_str(&data) {
-            Ok(v) => docs.push(v),
-            Err(_) => return internal_error(),
+    // Each row is already a valid JSON object (we wrote it); splice the raw
+    // bytes into an array instead of parsing every row into a `Value` tree
+    // and re-serializing the whole table on every GET /.
+    let mut body = String::with_capacity(raw.iter().map(String::len).sum::<usize>() + raw.len() + 2);
+    body.push('[');
+    for (i, doc) in raw.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
         }
+        body.push_str(doc);
     }
-    Json(docs).into_response()
+    body.push(']');
+    raw_json(body)
 }
 
 async fn get_single(State(state): State<Arc<AppState>>, Query(p): Query<LookupParams>) -> Response {
@@ -327,10 +355,7 @@ async fn get_single(State(state): State<Arc<AppState>>, Query(p): Query<LookupPa
     let Some((_, data)) = row else {
         return detail(StatusCode::NOT_FOUND, "Movie Not Found!");
     };
-    match serde_json::from_str::<Value>(&data) {
-        Ok(doc) => Json(doc).into_response(),
-        Err(_) => internal_error(),
-    }
+    raw_json(data)
 }
 
 async fn get_history(
@@ -363,7 +388,7 @@ async fn get_history(
     })();
     match result {
         Ok(snaps) => Json(json!({ "imdbid": imdb_id, "snapshots": snaps })).into_response(),
-        Err(_) => internal_error(),
+        Err(e) => internal_error(format!("failed to fetch history for {imdb_id}: {e}")),
     }
 }
 
@@ -373,14 +398,10 @@ async fn serve(host: String, port: u16) {
     let db_path = env::var("DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
     let omdb_url = env::var("OMDB_URL").unwrap_or_else(|_| DEFAULT_OMDB_URL.to_string());
 
-    if let Err(e) = init_db(&db_path) {
-        eprintln!("failed to initialize database at {db_path}: {e}");
-        exit(1);
-    }
-    let conn = match Connection::open(&db_path) {
+    let conn = match init_db(&db_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("failed to open database at {db_path}: {e}");
+            eprintln!("failed to initialize database at {db_path}: {e}");
             exit(1);
         }
     };
@@ -489,6 +510,13 @@ async fn refresh(db_path: String, limit: Option<i64>, sleep_secs: f64, dry_run: 
             exit(1);
         }
     };
+    // Deliberately a plain open, not init_db: a typo'd db_path should fail at
+    // the first SELECT, not silently create an empty schema and "refresh" it.
+    // busy_timeout is per-connection, so it needs setting here too (see init_db).
+    if let Err(e) = db.busy_timeout(Duration::from_secs(5)) {
+        eprintln!("failed to set busy_timeout: {e}");
+        exit(1);
+    }
     let rows_result = (|| -> rusqlite::Result<Vec<(String, String)>> {
         let mut stmt = db.prepare(
             "
