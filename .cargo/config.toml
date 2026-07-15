@@ -10,8 +10,9 @@ LIBSQLITE3_FLAGS = "-DSQLITE_DISABLE_LFS"
 
 # Statically link the C runtime for MUSL targets. At the time of writing (2026-06-01), this is
 # the default. But the plan is for the default to change to dynamic linking.
-# The whole point of MUSL with respect to ripgrep is to create a fully
-# statically linked executable.
+# The whole point of MUSL here is a fully statically linked executable — the
+# systemd unit (dist/systemd/*.service) locks the process to a single
+# no-interpreter ExecPaths, which only works if there's no dynamic loader.
 #
 # See: https://github.com/rust-lang/compiler-team/issues/422
 # See: https://github.com/rust-lang/compiler-team/issues/422#issuecomment-812135847
