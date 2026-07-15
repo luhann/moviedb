@@ -1,0 +1,68 @@
+[Unit]
+Description=moviedb API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# exec (not simple): `systemctl start` fails synchronously if the execve
+# fails — a missing binary or stripped exec bit (pct push without --perms)
+# surfaces immediately instead of as an async 203 in the journal
+Type=exec
+# Ephemeral UID per start; no passwd entry to target. User= names the
+# allocation so moviedb-refresh.service shares the same UID when it runs
+# concurrently — required for both to touch the same StateDirectory.
+# The static `moviedb` user must NOT exist (userdel moviedb).
+DynamicUser=true
+User=moviedb
+# /var/lib/private/moviedb, symlinked at /var/lib/moviedb; ownership is
+# fixed up recursively at every start, so DB_PATH stays unchanged.
+StateDirectory=moviedb
+EnvironmentFile=/etc/moviedb.env
+ExecStart=/opt/moviedb/moviedb serve --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+# Hardening — service only needs to write its own DB directory.
+# Verify the score with: systemd-analyze security moviedb
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+# Static binary, no interpreter — these would break CPython but not this
+MemoryDenyWriteExecute=true
+NoExecPaths=/
+ExecPaths=/opt/moviedb/moviedb
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+KeyringMode=private
+CapabilityBoundingSet=
+UMask=0077
+# DB writes + one outbound HTTPS call per POST: tiny resource envelope,
+# so cap it — a compromised process can't fork-bomb or balloon the host
+TasksMax=32
+MemoryMax=256M
+# Only bind the service port (best-effort: needs BPF delegation, may no-op
+# in an unprivileged LXC — check systemd-analyze security output)
+SocketBindDeny=any
+SocketBindAllow=tcp:8000
+# The next two are the usual 226/NAMESPACE suspects in unprivileged LXCs.
+# Enable one at a time; drop whichever breaks startup.
+#ProtectProc=invisible
+#ProcSubset=pid
+#PrivateUsers=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,45 @@
+[Unit]
+Description=moviedb OMDB refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Same User= name as moviedb.service so the dynamic UID matches while the
+# API is running — both units write the same StateDirectory (WAL allows
+# concurrent access; mismatched UIDs would not).
+DynamicUser=true
+User=moviedb
+StateDirectory=moviedb
+EnvironmentFile=/etc/moviedb.env
+ExecStart=/opt/moviedb/moviedb refresh
+
+# Same sandbox as the API, minus any listening socket
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+MemoryDenyWriteExecute=true
+NoExecPaths=/
+ExecPaths=/opt/moviedb/moviedb
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+KeyringMode=private
+CapabilityBoundingSet=
+UMask=0077
+TasksMax=16
+MemoryMax=128M
+SocketBindDeny=any
