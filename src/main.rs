@@ -13,6 +13,8 @@
 //! indexed generated columns. Every POST and refresh snapshots the full
 //! ratings array into ratings_history, making rating drift observable.
 //! Errors are FastAPI-shaped JSON: {"detail": "..."} with 401/404/422/429/520.
+//! One known parity gap: missing/malformed query params on POST / hit axum's
+//! built-in Query rejection — 400 plain text, where FastAPI returned 422 JSON.
 
 use std::collections::HashMap;
 use std::env;
@@ -36,6 +38,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use tokio::signal::unix::{SignalKind, signal};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/moviedb/movies.db";
 const DEFAULT_OMDB_URL: &str = "https://www.omdbapi.com/";
@@ -46,6 +49,13 @@ const DEFAULT_OMDB_URL: &str = "https://www.omdbapi.com/";
 // Generous for a single-user service — sized so a handful of concurrent
 // requests never wait on pool checkout, not for real multi-user load.
 const DB_POOL_SIZE: u32 = 8;
+// Headroom above DB_POOL_SIZE for non-DB blocking work — in practice
+// reqwest's default resolver running getaddrinfo — so an OMDB DNS lookup
+// never queues behind DB_POOL_SIZE in-flight DB tasks. Sized for one user:
+// POST / is the only handler that resolves DNS, so 4 is already generous,
+// and total threads (workers + blocking pool) must stay comfortably under
+// the systemd unit's TasksMax=32.
+const BLOCKING_POOL_HEADROOM: usize = 4;
 
 struct AppState {
     db: Pool<SqliteConnectionManager>,
@@ -202,6 +212,9 @@ where
         f(&mut conn)
     })
     .await
+    // Dev builds only: release compiles with panic=abort, so a panicking DB
+    // task takes the whole process down (systemd Restart=on-failure covers
+    // it) before this JoinError can ever be observed.
     .unwrap_or_else(|e| internal_error(format!("DB task panicked: {e}")))
 }
 
@@ -475,6 +488,22 @@ async fn get_history(
     .await
 }
 
+/// Resolves when SIGTERM (systemctl stop/restart, pct shutdown) or SIGINT
+/// (^C in a terminal) arrives; axum then stops accepting, drains in-flight
+/// requests, and returns — instead of the default of the signal killing the
+/// process mid-response. systemd's TimeoutStopSec (90s default) still
+/// backstops a hung drain with SIGKILL.
+async fn shutdown_signal() {
+    let mut sigterm =
+        signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+    tokio::select! {
+        _ = sigterm.recv() => {},
+        _ = sigint.recv() => {},
+    }
+    eprintln!("shutdown signal received, draining in-flight requests");
+}
+
 async fn serve(host: String, port: u16) {
     let api_key = require_env("API_KEY");
     let omdb_key = require_env("OMDB_KEY");
@@ -525,7 +554,10 @@ async fn serve(host: String, port: u16) {
             eprintln!("failed to set TCP_NODELAY on incoming connection: {e}");
         }
     });
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+    {
         eprintln!("server error: {e}");
         exit(1);
     }
@@ -772,8 +804,7 @@ async fn refresh(db_path: String, limit: Option<i64>, sleep_secs: f64, dry_run: 
             continue;
         }
 
-        let new_data =
-            serde_json::to_string(&Value::Object(new_doc.clone())).expect("doc serializes");
+        let new_data = serde_json::to_string(&new_doc).expect("doc serializes");
         let result = (|| -> rusqlite::Result<()> {
             let tx = db.transaction()?;
             tx.execute(
@@ -804,10 +835,16 @@ async fn refresh(db_path: String, limit: Option<i64>, sleep_secs: f64, dry_run: 
 // CLI
 
 fn require_env(name: &str) -> String {
-    env::var(name).unwrap_or_else(|_| {
-        eprintln!("{name} not set");
-        exit(1);
-    })
+    // Empty is as fatal as unset: an `API_KEY=` line in the env file would
+    // otherwise make check_key accept a blank x-api-key header (empty header
+    // values are legal HTTP), silently disabling auth.
+    match env::var(name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            eprintln!("{name} not set (or empty)");
+            exit(1);
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -850,10 +887,12 @@ fn main() {
     // requests can spin up far more OS threads than the pool it's meant to
     // pair with, quietly invalidating the "TasksMax=32 is sized for one user"
     // assumption this LXC's systemd unit relies on. Capping it here ties the
-    // blocking pool back to the same constant as the DB pool.
+    // blocking pool back to the DB pool constant, plus a small headroom so
+    // the pool's other tenant — reqwest's default resolver running
+    // getaddrinfo — doesn't queue behind DB_POOL_SIZE in-flight DB tasks.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .max_blocking_threads(DB_POOL_SIZE as usize)
+        .max_blocking_threads(DB_POOL_SIZE as usize + BLOCKING_POOL_HEADROOM)
         .build()
         .expect("failed to build tokio runtime")
         .block_on(async {
