@@ -112,6 +112,14 @@ def main():
             proc.terminate()
             proc.wait()
 
+        # empty API_KEY must be a startup failure, not silently-open auth
+        # (an empty x-api-key header is legal HTTP and would match it)
+        p = subprocess.run([BIN, "serve", "--port", "8124"],
+                           env=dict(env, API_KEY=""),
+                           capture_output=True, text=True, timeout=10)
+        results.append(("refuses empty API_KEY",
+                        p.returncode == 1 and "API_KEY" in p.stderr))
+
         # refresh edge cases: null Personal Value skips without an OMDB call;
         # Response=True missing Title skips without persisting
         db = sqlite3.connect(db_path)
