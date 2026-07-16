@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::process::exit;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -31,15 +31,24 @@ use bytes::Bytes;
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use futures_util::stream;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/moviedb/movies.db";
 const DEFAULT_OMDB_URL: &str = "https://www.omdbapi.com/";
+// SQLite's WAL mode natively supports many concurrent readers alongside one
+// writer; a pool lets GET / GET /single / GET /history actually use that
+// instead of queuing behind a single in-process lock (see commit message /
+// CLAUDE.md for the benchmark that found this serializing every GET).
+// Generous for a single-user service — sized so a handful of concurrent
+// requests never wait on pool checkout, not for real multi-user load.
+const DB_POOL_SIZE: u32 = 8;
 
 struct AppState {
-    db: Mutex<Connection>,
+    db: Pool<SqliteConnectionManager>,
     client: reqwest::Client,
     api_key: String,
     omdb_key: String,
@@ -59,7 +68,7 @@ fn utcnow() -> String {
 /// busy_timeout and synchronous reset per-connection (unlike journal_mode,
 /// which is sticky in the DB file itself) — serve and refresh are separate
 /// processes/connections, so both must set these independently.
-fn set_connection_pragmas(db: &Connection) -> rusqlite::Result<()> {
+fn set_connection_pragmas(db: &mut Connection) -> rusqlite::Result<()> {
     // SQLite's default busy_timeout of 0 turns any write collision between
     // the two processes into an instant SQLITE_BUSY. Writers hold the lock
     // ~1ms; retry up to 5s.
@@ -73,10 +82,10 @@ fn set_connection_pragmas(db: &Connection) -> rusqlite::Result<()> {
 }
 
 fn init_db(path: &str) -> rusqlite::Result<Connection> {
-    let db = Connection::open(path)?;
+    let mut db = Connection::open(path)?;
     // WAL first: synchronous=NORMAL's meaning depends on journal_mode.
     db.pragma_update(None, "journal_mode", "WAL")?;
-    set_connection_pragmas(&db)?;
+    set_connection_pragmas(&mut db)?;
     db.execute(
         "
         CREATE TABLE IF NOT EXISTS movies (
@@ -106,6 +115,17 @@ fn init_db(path: &str) -> rusqlite::Result<Connection> {
         [],
     )?;
     Ok(db)
+}
+
+/// The bootstrap connection above creates the schema and puts the file into
+/// WAL mode, which is sticky in the file itself — every pooled connection
+/// opened afterward inherits it. Each of those still needs its own
+/// busy_timeout/synchronous set (see set_connection_pragmas), which
+/// `with_init` runs on every connection the pool creates.
+fn build_pool(path: &str) -> Result<Pool<SqliteConnectionManager>, Box<dyn std::error::Error>> {
+    init_db(path)?;
+    let manager = SqliteConnectionManager::file(path).with_init(set_connection_pragmas);
+    Ok(Pool::builder().max_size(DB_POOL_SIZE).build(manager)?)
 }
 
 fn ratings_entry_field<'a>(entry: &'a Value, key: &str) -> &'a str {
@@ -158,6 +178,31 @@ fn internal_error(context: impl std::fmt::Display) -> Response {
 /// `Value` tree just to immediately re-serialize it is pure waste.
 fn raw_json(body: String) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// Runs `f` against a pooled connection on a blocking-pool thread. Both pool
+/// checkout and every rusqlite call are synchronous; running them inline in
+/// an async handler would park whichever tokio worker thread runs it for as
+/// long as the checkout/query takes — on this LXC's few worker threads, that
+/// can stall unrelated in-flight requests, not just the one waiting on the
+/// DB. `f` returns the finished Response itself (not just a query result)
+/// since what happens after the query varies per handler (streaming, Json,
+/// plain text) and none of it does further I/O, so there's no reason to hop
+/// back to the async side first.
+async fn with_conn<F>(state: &AppState, f: F) -> Response
+where
+    F: FnOnce(&mut Connection) -> Response + Send + 'static,
+{
+    let pool = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = match pool.get() {
+            Ok(c) => c,
+            Err(e) => return internal_error(format!("failed to check out DB connection: {e}")),
+        };
+        f(&mut conn)
+    })
+    .await
+    .unwrap_or_else(|e| internal_error(format!("DB task panicked: {e}")))
 }
 
 /// Constant-time byte comparison: if lengths differ fail, else XOR-fold.
@@ -248,11 +293,14 @@ async fn add_movie(State(state): State<Arc<AppState>>, Query(p): Query<AddParams
         .await
     {
         Ok(r) => r,
-        Err(e) => return internal_error(format!("OMDB request failed: {e}")),
+        // without_url(): reqwest::Error's Display includes the request URL
+        // (query string and all) when one is attached — which for a failed
+        // send() means the OMDB apikey ends up readable in journalctl.
+        Err(e) => return internal_error(format!("OMDB request failed: {}", e.without_url())),
     };
     let movie: Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => return internal_error(format!("OMDB response JSON parse failed: {e}")),
+        Err(e) => return internal_error(format!("OMDB response JSON parse failed: {}", e.without_url())),
     };
 
     if movie.get("Response").and_then(Value::as_str) == Some("True") {
@@ -294,12 +342,14 @@ async fn add_movie(State(state): State<Arc<AppState>>, Query(p): Query<AddParams
         let Some(title) = out.get("title").and_then(Value::as_str).map(String::from) else {
             return internal_error("OMDB response missing Title"); // Python: KeyError -> 500
         };
-        // Borrowed, not cloned: `out` outlives this (through serialization
-        // below), and snapshot_ratings only needs a &[Value].
-        let ratings: &[Value] = out
+        // Owned, not borrowed: the write below runs on a blocking-pool thread
+        // (see with_conn), which needs a 'static closure — a &[Value] into
+        // `out` can't cross that boundary.
+        let ratings: Vec<Value> = out
             .get("ratings")
             .and_then(Value::as_array)
-            .map_or(&[][..], Vec::as_slice);
+            .cloned()
+            .unwrap_or_default();
 
         let now = utcnow();
         let data = match serde_json::to_string(&out) {
@@ -307,21 +357,23 @@ async fn add_movie(State(state): State<Arc<AppState>>, Query(p): Query<AddParams
             Err(e) => return internal_error(format!("failed to serialize movie doc: {e}")),
         };
         // Single transaction: upsert + history snapshot.
-        let mut conn = state.db.lock().unwrap();
-        let result = (|| -> rusqlite::Result<()> {
-            let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT OR REPLACE INTO movies (imdb_id, data) VALUES (?, ?)",
-                params![imdbid, data],
-            )?;
-            snapshot_ratings(&tx, &imdbid, &title, ratings, &now)?;
-            tx.commit()
-        })();
-        if let Err(e) = result {
-            return internal_error(format!("failed to write movie {imdbid}: {e}"));
-        }
-        // Python: PlainTextResponse(out["title"]) — 200, text/plain.
-        return (StatusCode::OK, title).into_response();
+        return with_conn(&state, move |conn| {
+            let result = (|| -> rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO movies (imdb_id, data) VALUES (?, ?)",
+                    params![imdbid, data],
+                )?;
+                snapshot_ratings(&tx, &imdbid, &title, &ratings, &now)?;
+                tx.commit()
+            })();
+            match result {
+                // Python: PlainTextResponse(out["title"]) — 200, text/plain.
+                Ok(()) => (StatusCode::OK, title).into_response(),
+                Err(e) => internal_error(format!("failed to write movie {imdbid}: {e}")),
+            }
+        })
+        .await;
     }
 
     let error = movie.get("Error").and_then(Value::as_str).unwrap_or("");
@@ -334,87 +386,93 @@ async fn add_movie(State(state): State<Arc<AppState>>, Query(p): Query<AddParams
     if error == "Movie not found!" {
         return detail(StatusCode::NOT_FOUND, "Movie Not Found!");
     }
+    eprintln!("OMDB returned an unrecognized error for {} ({}): {error}", p.title, p.year);
     detail(StatusCode::from_u16(520).unwrap(), "Unknown Error!")
 }
 
 async fn list_movies(State(state): State<Arc<AppState>>) -> Response {
-    let conn = state.db.lock().unwrap();
-    let result = (|| -> rusqlite::Result<Vec<String>> {
-        let mut stmt = conn.prepare("SELECT data FROM movies")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect()
-    })();
-    drop(conn);
-    let raw = match result {
-        Ok(raw) => raw,
-        Err(e) => return internal_error(format!("failed to list movies: {e}")),
-    };
-    // Each row is already a valid JSON object (we wrote it); stream the raw
-    // bytes as array elements instead of parsing every row into a `Value`
-    // tree, or even concatenating them into one contiguous buffer, before
-    // the response can start going out.
-    let n = raw.len();
-    let chunks = std::iter::once(Bytes::from_static(b"["))
-        .chain(raw.into_iter().enumerate().map(move |(i, doc)| {
-            let mut buf = doc.into_bytes();
-            if i + 1 < n {
-                buf.push(b',');
-            }
-            Bytes::from(buf)
-        }))
-        .chain(std::iter::once(Bytes::from_static(b"]")))
-        .map(Ok::<_, std::convert::Infallible>);
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        Body::from_stream(stream::iter(chunks)),
-    )
-        .into_response()
+    with_conn(&state, |conn| {
+        let result = (|| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = conn.prepare("SELECT data FROM movies")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect()
+        })();
+        let raw = match result {
+            Ok(raw) => raw,
+            Err(e) => return internal_error(format!("failed to list movies: {e}")),
+        };
+        // Each row is already a valid JSON object (we wrote it); stream the
+        // raw bytes as array elements instead of parsing every row into a
+        // `Value` tree, or even concatenating them into one contiguous
+        // buffer, before the response can start going out.
+        let n = raw.len();
+        let chunks = std::iter::once(Bytes::from_static(b"["))
+            .chain(raw.into_iter().enumerate().map(move |(i, doc)| {
+                let mut buf = doc.into_bytes();
+                if i + 1 < n {
+                    buf.push(b',');
+                }
+                Bytes::from(buf)
+            }))
+            .chain(std::iter::once(Bytes::from_static(b"]")))
+            .map(Ok::<_, std::convert::Infallible>);
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            Body::from_stream(stream::iter(chunks)),
+        )
+            .into_response()
+    })
+    .await
 }
 
 async fn get_single(State(state): State<Arc<AppState>>, Query(p): Query<LookupParams>) -> Response {
-    let conn = state.db.lock().unwrap();
-    let row = match resolve_movie(&conn, &p) {
-        Ok(row) => row,
-        Err(resp) => return *resp,
-    };
-    let Some((_, data)) = row else {
-        return detail(StatusCode::NOT_FOUND, "Movie Not Found!");
-    };
-    raw_json(data)
+    with_conn(&state, move |conn| {
+        let row = match resolve_movie(conn, &p) {
+            Ok(row) => row,
+            Err(resp) => return *resp,
+        };
+        let Some((_, data)) = row else {
+            return detail(StatusCode::NOT_FOUND, "Movie Not Found!");
+        };
+        raw_json(data)
+    })
+    .await
 }
 
 async fn get_history(
     State(state): State<Arc<AppState>>,
     Query(p): Query<LookupParams>,
 ) -> Response {
-    let conn = state.db.lock().unwrap();
-    let row = match resolve_movie(&conn, &p) {
-        Ok(row) => row,
-        Err(resp) => return *resp,
-    };
-    let Some((imdb_id, _)) = row else {
-        return detail(StatusCode::NOT_FOUND, "Movie Not Found!");
-    };
-    let result = (|| -> rusqlite::Result<Vec<Value>> {
-        let mut stmt = conn.prepare(
-            "
+    with_conn(&state, move |conn| {
+        let row = match resolve_movie(conn, &p) {
+            Ok(row) => row,
+            Err(resp) => return *resp,
+        };
+        let Some((imdb_id, _)) = row else {
+            return detail(StatusCode::NOT_FOUND, "Movie Not Found!");
+        };
+        let result = (|| -> rusqlite::Result<Vec<Value>> {
+            let mut stmt = conn.prepare(
+                "
         SELECT observed, source, value FROM ratings_history
         WHERE imdb_id = ? ORDER BY observed ASC, source ASC
         ",
-        )?;
-        let rows = stmt.query_map(params![imdb_id], |r| {
-            Ok(json!({
-                "observed": r.get::<_, String>(0)?,
-                "source": r.get::<_, String>(1)?,
-                "value": r.get::<_, String>(2)?,
-            }))
-        })?;
-        rows.collect()
-    })();
-    match result {
-        Ok(snaps) => Json(json!({ "imdbid": imdb_id, "snapshots": snaps })).into_response(),
-        Err(e) => internal_error(format!("failed to fetch history for {imdb_id}: {e}")),
-    }
+            )?;
+            let rows = stmt.query_map(params![imdb_id], |r| {
+                Ok(json!({
+                    "observed": r.get::<_, String>(0)?,
+                    "source": r.get::<_, String>(1)?,
+                    "value": r.get::<_, String>(2)?,
+                }))
+            })?;
+            rows.collect()
+        })();
+        match result {
+            Ok(snaps) => Json(json!({ "imdbid": imdb_id, "snapshots": snaps })).into_response(),
+            Err(e) => internal_error(format!("failed to fetch history for {imdb_id}: {e}")),
+        }
+    })
+    .await
 }
 
 async fn serve(host: String, port: u16) {
@@ -423,8 +481,8 @@ async fn serve(host: String, port: u16) {
     let db_path = env::var("DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
     let omdb_url = env::var("OMDB_URL").unwrap_or_else(|_| DEFAULT_OMDB_URL.to_string());
 
-    let conn = match init_db(&db_path) {
-        Ok(c) => c,
+    let pool = match build_pool(&db_path) {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("failed to initialize database at {db_path}: {e}");
             exit(1);
@@ -436,7 +494,7 @@ async fn serve(host: String, port: u16) {
         .expect("failed to build HTTP client");
 
     let state = Arc::new(AppState {
-        db: Mutex::new(conn),
+        db: pool,
         client,
         api_key,
         omdb_key,
@@ -456,6 +514,17 @@ async fn serve(host: String, port: u16) {
             exit(1);
         }
     };
+    // axum::serve doesn't set TCP_NODELAY on accepted sockets. GET /'s
+    // chunked body (no Content-Length, since the row count isn't known until
+    // the query runs) writes headers and the first chunk as separate TCP
+    // segments; without NODELAY that hits the classic Nagle/delayed-ACK
+    // stall — a flat ~35ms tax on every uncontended GET /, confirmed by
+    // benchmark. GET /single is unaffected (known Content-Length, one write).
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp_stream| {
+        if let Err(e) = tcp_stream.set_nodelay(true) {
+            eprintln!("failed to set TCP_NODELAY on incoming connection: {e}");
+        }
+    });
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("server error: {e}");
         exit(1);
@@ -538,7 +607,7 @@ async fn refresh(db_path: String, limit: Option<i64>, sleep_secs: f64, dry_run: 
     // Deliberately a plain open, not init_db: a typo'd db_path should fail at
     // the first SELECT, not silently create an empty schema and "refresh" it.
     // Pragmas are per-connection though, so they still need setting here too.
-    if let Err(e) = set_connection_pragmas(&db) {
+    if let Err(e) = set_connection_pragmas(&mut db) {
         eprintln!("failed to set connection pragmas: {e}");
         exit(1);
     }
@@ -610,7 +679,9 @@ async fn refresh(db_path: String, limit: Option<i64>, sleep_secs: f64, dry_run: 
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("OMDB request failed for {imdb_id}: {e}");
+                // without_url(): strip the apikey-bearing request URL before
+                // this hits stdout/journalctl (see add_movie's OMDB call).
+                eprintln!("OMDB request failed for {imdb_id}: {}", e.without_url());
                 exit(1); // Python: urlopen raises, crashing the script
             }
         };
@@ -771,23 +842,37 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() {
-    match Cli::parse().command {
-        Command::Serve { host, port } => serve(host, port).await,
-        Command::Refresh {
-            db_path,
-            limit,
-            sleep,
-            dry_run,
-        } => {
-            let db_path = db_path
-                .or_else(|| env::var("DB_PATH").ok().filter(|s| !s.is_empty()))
-                .unwrap_or_else(|| {
-                    eprintln!("moviedb refresh: no db_path given and DB_PATH not set");
-                    exit(2);
-                });
-            refresh(db_path, limit, sleep, dry_run).await;
-        }
-    }
+fn main() {
+    // Every DB-touching handler runs its query on a spawn_blocking thread
+    // (see with_conn), gated on checkout by the DB_POOL_SIZE-sized r2d2 pool
+    // — but tokio's *blocking thread pool itself* defaults to a cap of 512,
+    // independent of DB_POOL_SIZE. Left uncapped, a burst of concurrent
+    // requests can spin up far more OS threads than the pool it's meant to
+    // pair with, quietly invalidating the "TasksMax=32 is sized for one user"
+    // assumption this LXC's systemd unit relies on. Capping it here ties the
+    // blocking pool back to the same constant as the DB pool.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(DB_POOL_SIZE as usize)
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async {
+            match Cli::parse().command {
+                Command::Serve { host, port } => serve(host, port).await,
+                Command::Refresh {
+                    db_path,
+                    limit,
+                    sleep,
+                    dry_run,
+                } => {
+                    let db_path = db_path
+                        .or_else(|| env::var("DB_PATH").ok().filter(|s| !s.is_empty()))
+                        .unwrap_or_else(|| {
+                            eprintln!("moviedb refresh: no db_path given and DB_PATH not set");
+                            exit(2);
+                        });
+                    refresh(db_path, limit, sleep, dry_run).await;
+                }
+            }
+        });
 }
