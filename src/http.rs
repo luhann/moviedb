@@ -2,6 +2,7 @@
 //! share. Endpoints (all require x-api-key):
 //!   POST /movies  ?title=&rating=&year=     fetch OMDB, upsert, snapshot ratings
 //!   GET  /movies  [?title=] [?year=]        the collection, optionally filtered
+//!   GET  /movies/recent  [?limit=]          most-recently-refreshed movies (default 10, max 50)
 //!   GET  /movies/{imdb_id}                  one movie
 //!   GET  /movies/{imdb_id}/history          ratings snapshots, oldest first
 //!
@@ -178,6 +179,17 @@ struct FilterParams {
     title: Option<String>,
     year: Option<String>,
 }
+
+/// `GET /movies/recent`'s only param. Missing/unparseable means
+/// `DEFAULT_RECENT_LIMIT`; anything above `MAX_RECENT_LIMIT` is clamped, not
+/// rejected — same defensive posture as every other collection endpoint.
+#[derive(Deserialize)]
+struct RecentParams {
+    limit: Option<usize>,
+}
+
+const DEFAULT_RECENT_LIMIT: usize = 10;
+const MAX_RECENT_LIMIT: usize = 50;
 
 /// Like `axum::extract::Query`, but a parse failure returns this API's own
 /// `{"detail": "..."}` JSON shape (422) instead of axum's default rejection
@@ -475,6 +487,60 @@ async fn list_movies(
     .await
 }
 
+/// The dashboard's "recently catalogued" view: the N movies with the most
+/// recent `ratings_history` snapshot, newest first. Unlike `list_movies`,
+/// this is `LIMIT`-bounded (at most `MAX_RECENT_LIMIT` rows), so it's built
+/// as one `Json` response rather than streamed, and each doc needs its
+/// `last_refreshed` timestamp folded in — `data` gets parsed back into a
+/// `Value` for that (the raw-bytes shortcut `raw_json`/`list_movies` use only
+/// works when the stored bytes are the entire response body verbatim).
+async fn get_recent(
+    State(state): State<Arc<AppState>>,
+    Params(p): Params<RecentParams>,
+) -> Response {
+    let limit = p.limit.unwrap_or(DEFAULT_RECENT_LIMIT).clamp(1, MAX_RECENT_LIMIT);
+    with_conn(&state, move |conn| {
+        let result = (|| -> rusqlite::Result<Vec<(String, String)>> {
+            let mut stmt = conn.prepare(
+                "
+                SELECT m.data, h.last_refreshed
+                FROM movies m
+                JOIN (
+                    SELECT imdb_id, MAX(observed) AS last_refreshed
+                    FROM ratings_history
+                    GROUP BY imdb_id
+                ) h ON h.imdb_id = m.imdb_id
+                ORDER BY h.last_refreshed DESC
+                LIMIT ?
+                ",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect()
+        })();
+        let raw = match result {
+            Ok(raw) => raw,
+            Err(e) => return internal_error(format!("failed to list recent movies: {e}")),
+        };
+        let mut movies = Vec::with_capacity(raw.len());
+        for (data, last_refreshed) in raw {
+            let mut doc: Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(e) => {
+                    return internal_error(format!("failed to parse stored movie doc: {e}"));
+                }
+            };
+            if let Value::Object(ref mut obj) = doc {
+                obj.insert("last_refreshed".to_string(), Value::String(last_refreshed));
+            }
+            movies.push(doc);
+        }
+        Json(json!({ "movies": movies })).into_response()
+    })
+    .await
+}
+
 async fn get_movie(State(state): State<Arc<AppState>>, ImdbId(imdb_id): ImdbId) -> Response {
     with_conn(&state, move |conn| {
         let row = conn
@@ -592,6 +658,7 @@ pub(crate) async fn serve(host: String, port: u16) {
     });
     let app = Router::new()
         .route("/movies", get(list_movies).post(add_movie))
+        .route("/movies/recent", get(get_recent))
         .route("/movies/{imdb_id}", get(get_movie))
         .route("/movies/{imdb_id}/history", get(get_history))
         .layer(middleware::from_fn_with_state(state.clone(), check_key))
