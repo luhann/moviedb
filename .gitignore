@@ -16,5 +16,8 @@
 # harmless to guard against anyway
 __pycache__/
 
+# tests/fuzz_test.py — schemathesis' cache of previously-found examples
+.schemathesis/
+
 .vscode/
 .claude/

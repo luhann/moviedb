@@ -55,6 +55,48 @@ Note: the build currently requires a **nightly** toolchain
 `-Z threads` in the target rustflags). Remove those lines if a stable-only
 build is needed, no non-dev code depends on nightly features.
 
+## API spec
+
+`openapi.yaml` is the machine-readable contract for the endpoints above —
+hand-written and checked in, not generated from the handlers. It's what you'd
+point a client generator, a docs renderer (Redoc/Scalar), or a fuzzer at.
+
+The movie doc is an OMDB passthrough, so `Movie` is deliberately a *partial*
+schema: the fields this API actually guarantees (`imdb_id`, `title`,
+`ratings`) are required, and `additionalProperties: true` lets the rest of
+OMDB's payload through without a spec change every time OMDB adds a field.
+
+A hand-written spec can drift from the code, so `tests/fuzz_test.py` checks it
+against a running binary:
+
+```bash
+python3 tests/fuzz_test.py          # ~2000 generated requests, ~6s
+python3 tests/fuzz_test.py -n 200 -w 4      # deeper: ~9000 requests, ~25s
+python3 tests/fuzz_test.py --seed 12345     # reproduce a failing run
+```
+
+It boots the real binary against the same stub OMDB and temp DB as
+`smoke_test.py` (on ports 8125/8099, so the two can run concurrently), seeds
+one movie, then has [schemathesis](https://schemathesis.readthedocs.io/)
+generate requests from the spec and assert every response conforms: status
+documented, content type documented, body matching the schema, no 5xx, and
+auth actually enforced. Where `smoke_test.py` asserts the cases I thought of,
+this asserts the contract itself — it's how the 400/422/404 boundaries stay
+honest.
+
+schemathesis is not a repo dependency; `uv run` fetches it into an ephemeral
+environment for the duration of the run. Needs `uv` (or `schemathesis`
+already on `PATH`), and network access the first time.
+
+One check is disabled deliberately: `positive_data_acceptance` asserts that
+schema-valid input never returns 4xx, which is wrong for a lookup — `tt404`
+is a perfectly valid `imdb_id` for a movie that simply isn't in the database,
+and 404 is the correct answer.
+
+Not wired into `scripts/deploy.sh` — the smoke test is the pre-push gate;
+this one is a dev-time tool. Add it there if you'd rather block deploys on
+contract drift too.
+
 ### Create the LXC (on the Proxmox host)
 
 This step is optional, you can deploy the binary anywhere you like. This is how I deploy it.
@@ -115,12 +157,13 @@ The script is idempotent — rerunning it on migrated data changes nothing.
 Upgrades are the same push + `systemctl restart moviedb`. `scripts/deploy.sh`
 does the whole upgrade from the workstation (build, smoke test, push via the
 Proxmox host, restart, verify); set `PVE_HOST`/`VMID` if the defaults
-(`root@pve.lan`, 210) don't match. If pushing manually:
+(`root@fragment2.trusted`, 401) don't match — `pct` only works on the node
+actually hosting the container. If pushing manually:
 
 ```bash
 # --perms matters: pct push defaults to 0644 root:root on EVERY push,
 # so an upgrade push without it strips the exec bit -> systemd 203/EXEC
-pct push 210 target/x86_64-unknown-linux-musl/release/moviedb /opt/moviedb/moviedb --perms 0755
+pct push 401 target/x86_64-unknown-linux-musl/release/moviedb /opt/moviedb/moviedb --perms 0755
 ```
 
 ## Routing

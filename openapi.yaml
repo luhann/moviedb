@@ -1,0 +1,473 @@
+openapi: 3.1.0
+
+# The contract for the endpoints in src/http.rs. Hand-written and checked in
+# rather than generated from the handlers (no utoipa dependency, no
+# annotations on five functions) — the trade is that this file can drift, so
+# tests/fuzz_test.py runs schemathesis against a live binary to catch drift
+# the same way smoke_test.py catches regressions.
+#
+# The movie doc is an OMDB passthrough: every OMDB field is stored, with its
+# key snake_cased. So `Movie` is deliberately a *partial* schema — the fields
+# this API guarantees are listed and required, and `additionalProperties:
+# true` lets the rest of OMDB's payload (plot, actors, poster, ...) through
+# without a schema change every time OMDB adds a field.
+
+info:
+  title: moviedb
+  version: 2.1.0
+  description: |
+    Self-hosted movie rating API. A movie's canonical address is
+    `/movies/{imdb_id}`; title/year lookup is a filter on the collection.
+    Every response, success or error, is JSON. Errors are RFC 9457
+    problem-details objects served as `application/problem+json`.
+  license:
+    name: GPL-3.0
+
+servers:
+  - url: http://127.0.0.1:8123
+    description: local test harness (tests/fuzz_test.py, tests/smoke_test.py)
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: movies
+
+paths:
+  /movies:
+    get:
+      tags: [movies]
+      summary: The movie collection, optionally filtered
+      description: |
+        Both filters are optional and combine with AND; omitting both returns
+        the whole collection. An empty value (`?year=`) counts as "not
+        provided" rather than matching a literal empty-string column.
+
+        Matching is exact and case-sensitive, served by the
+        `(title, year)` index over the generated columns. `(title, year)` is
+        not unique: a filter matching several movies returns all of them, and
+        one matching none returns `[]` — with a non-unique key, multiple and
+        zero matches are both ordinary data, not errors.
+      operationId: listMovies
+      parameters:
+        - name: title
+          in: query
+          required: false
+          description: Exact, case-sensitive title filter.
+          schema:
+            type: string
+            examples: ["The Matrix"]
+        - name: year
+          in: query
+          required: false
+          description: Exact year filter. A string, matching how OMDB reports it.
+          schema:
+            type: string
+            examples: ["1999"]
+      responses:
+        "200":
+          description: The matching movies, as a bare array.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Movie"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+    post:
+      tags: [movies]
+      summary: Fetch a title from OMDB, store it, and snapshot its ratings
+      description: |
+        Looks the title up at OMDB by `(title, year)`, snake_cases the
+        payload, appends `{"source": "Personal", "value": <rating>}` to the
+        ratings array, and upserts it keyed by `imdb_id`. Every call appends
+        one `ratings_history` row per rating source, so re-POSTing an
+        existing title is how a re-rate is recorded.
+
+        Parameters are query-string, not a request body. All three are
+        required and must be non-empty.
+      operationId: addMovie
+      parameters:
+        - name: title
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            examples: ["The Matrix"]
+        - name: rating
+          in: query
+          required: true
+          description: Your own rating, stored verbatim as the `Personal` entry.
+          schema:
+            type: string
+            minLength: 1
+            examples: ["9/10"]
+        - name: year
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            examples: ["1999"]
+      responses:
+        "200":
+          description: |
+            This `imdb_id` already existed; the stored doc was updated and is
+            returned. No `Location` header — the resource is not new.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Movie"
+        "201":
+          description: A new movie was stored.
+          headers:
+            Location:
+              description: The new movie's canonical URI, `/movies/{imdb_id}`.
+              required: true
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Movie"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: OMDB has no movie matching this title and year.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+        "502":
+          description: OMDB returned an error this server doesn't recognize.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            Either OMDB's shared daily request quota is exhausted, or the
+            server is briefly out of DB capacity. The two are distinguished by
+            the problem `type` URN so clients can branch without parsing
+            `detail` prose.
+          headers:
+            Retry-After:
+              description: 86400 for the OMDB quota, 1 for at-capacity.
+              required: true
+              schema:
+                type: string
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /movies/recent:
+    get:
+      tags: [movies]
+      summary: Most-recently-refreshed movies, newest first
+      description: |
+        Ordered by each movie's newest `ratings_history` snapshot, with that
+        timestamp folded into the doc as `last_refreshed`. Like `/movies`,
+        this is a bare array — a response is an object only when it carries
+        fields beyond the collection itself.
+      operationId: listRecent
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Defaults to 10. Values above 50 are clamped, not rejected.
+            `limit=0` is a valid request for zero movies and returns `[]`.
+            The upper bound here is the parseable range (`usize`); anything
+            outside it is a 422, like any other unparseable query param.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 18446744073709551615
+            default: 10
+            examples: [8]
+      responses:
+        "200":
+          description: The most recently refreshed movies, as a bare array.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RecentMovie"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /movies/{imdb_id}:
+    parameters:
+      - $ref: "#/components/parameters/ImdbId"
+    get:
+      tags: [movies]
+      summary: One movie
+      description: |
+        The canonical address for a movie, and what a 201 `Location` points
+        at. This is the only endpoint that can 404 on a missing movie.
+      operationId: getMovie
+      responses:
+        "200":
+          description: The stored movie doc.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Movie"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+  /movies/{imdb_id}/history:
+    parameters:
+      - $ref: "#/components/parameters/ImdbId"
+    get:
+      tags: [movies]
+      summary: Ratings snapshots for one movie, oldest first
+      description: |
+        One entry per (source, observation). 404 only when the *movie* is
+        unknown — a known movie with no snapshots yet is a real resource
+        whose history is empty.
+
+        Note the migration seeded one snapshot per movie stamped at migration
+        time, though those values were pulled at an earlier, unrecorded date.
+        Treat the first snapshot per movie as "current as of migration at the
+        latest".
+      operationId: getHistory
+      responses:
+        "200":
+          description: The movie's ratings history.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/History"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalServerError" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: |
+        Required on every request. The auth layer sits above the routing
+        fallbacks, so an unknown path without a valid key is a 401, not a 404.
+
+  parameters:
+    ImdbId:
+      name: imdb_id
+      in: path
+      required: true
+      description: The IMDb ID, e.g. `tt0133093`. Used verbatim as the primary key.
+      schema:
+        type: string
+        pattern: "^tt[0-9]+$"
+        # tests/fuzz_test.py seeds exactly this movie before the run, so the
+        # examples phase exercises the 200 path rather than only 404s.
+        examples: ["tt0133093"]
+
+  schemas:
+    Rating:
+      type: object
+      description: |
+        One rating from one source. `Personal` is your own, appended by this
+        API; the rest come from OMDB. Values are strings in whatever scale the
+        source uses (`8.7/10`, `87%`, `73`), deliberately not normalized.
+      required: [source, value]
+      properties:
+        source:
+          type: string
+          examples: ["Internet Movie Database", "Rotten Tomatoes", "Personal"]
+        value:
+          type: [string, "null"]
+          description: |
+            Null is possible for a `Personal` entry on rows predating the
+            rating being recorded; `refresh` skips those rather than
+            inventing one.
+          examples: ["8.7/10"]
+      additionalProperties: false
+
+    Movie:
+      type: object
+      description: |
+        A stored movie doc: OMDB's payload with every key snake_cased, plus a
+        `ratings` array with the `Personal` entry appended. OMDB's `Response`
+        field is dropped as redundant. Only the fields this API itself
+        guarantees are listed — everything else OMDB returns is passed
+        through untouched.
+      required: [imdb_id, title, ratings]
+      properties:
+        imdb_id:
+          type: string
+          examples: ["tt0133093"]
+        title:
+          type: string
+          examples: ["The Matrix"]
+        year:
+          type: string
+          examples: ["1999"]
+        imdb_rating:
+          type: string
+          examples: ["8.7"]
+        box_office:
+          type: string
+          examples: ["$172,076,928"]
+        ratings:
+          type: array
+          description: Always present; the `Personal` entry is always last.
+          items:
+            $ref: "#/components/schemas/Rating"
+      additionalProperties: true
+
+    RecentMovie:
+      allOf:
+        - $ref: "#/components/schemas/Movie"
+        - type: object
+          required: [last_refreshed]
+          properties:
+            last_refreshed:
+              type: string
+              format: date-time
+              description: ISO-8601 UTC timestamp of this movie's newest snapshot.
+              examples: ["2026-08-14T09:12:44.317+00:00"]
+
+    Snapshot:
+      type: object
+      required: [observed, source, value]
+      properties:
+        observed:
+          type: string
+          format: date-time
+          description: ISO-8601 UTC timestamp, millisecond precision.
+          examples: ["2026-08-14T09:12:44.317+00:00"]
+        source:
+          type: string
+          examples: ["Internet Movie Database"]
+        value:
+          type: string
+          examples: ["8.7/10"]
+      additionalProperties: false
+
+    History:
+      type: object
+      description: |
+        An object rather than a bare array because it carries `imdb_id`
+        alongside the collection.
+      required: [imdb_id, snapshots]
+      properties:
+        imdb_id:
+          type: string
+          examples: ["tt0133093"]
+        snapshots:
+          type: array
+          description: Oldest first, ties broken by source.
+          items:
+            $ref: "#/components/schemas/Snapshot"
+      additionalProperties: false
+
+    Problem:
+      type: object
+      description: An RFC 9457 problem-details object.
+      required: [type, title, status, detail]
+      properties:
+        type:
+          type: string
+          description: |
+            `about:blank` wherever the status code says it all. The two
+            distinguishable 503s carry a URN instead.
+          examples:
+            - "about:blank"
+            - "urn:moviedb:problem:omdb-quota-exhausted"
+            - "urn:moviedb:problem:at-capacity"
+        title:
+          type: string
+          description: Restates the HTTP status line.
+          examples: ["Not Found"]
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+          description: Explains this specific occurrence.
+          examples: ["Movie not found"]
+      additionalProperties: false
+
+  responses:
+    BadRequest:
+      description: Malformed path parameter (undecodable percent-escapes).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    Unauthorized:
+      description: Missing or invalid `x-api-key`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    NotFound:
+      description: Unknown `imdb_id`, or a path this API doesn't serve.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    MethodNotAllowed:
+      description: Method not supported on this path.
+      headers:
+        Allow:
+          required: true
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    UnprocessableEntity:
+      description: Query params missing, empty, or unparseable.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    InternalServerError:
+      description: Internal error; see the server logs (`journalctl -u moviedb`).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    ServiceUnavailable:
+      description: |
+        All DB permits stayed busy past the load-shed deadline
+        (`urn:moviedb:problem:at-capacity`).
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"

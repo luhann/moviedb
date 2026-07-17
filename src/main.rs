@@ -1,6 +1,8 @@
-//! moviedb — self-hosted movie rating API. Single binary: `serve` (the API)
+//! moviedb
+//!
+//! Self-hosted movie rating API. Single binary: `serve` (the API)
 //! and `refresh` (re-pull OMDB data, cron-able). Originally a set of AWS
-//! Lambdas, then a `FastAPI` service; this Rust binary is what replaced both.
+//! Lambdas, then I migrated to a `FastAPI` service; this Rust binary is what replaced both.
 //!
 //! See `http.rs` for the endpoint list and error shape, `refresh.rs` for the
 //! refresh job, `db.rs` for the SQLite schema/connection setup shared by
@@ -18,8 +20,8 @@ use clap::{Parser, Subcommand};
 
 use db::DB_POOL_SIZE;
 
-// Headroom above DB_POOL_SIZE for non-DB blocking work — in practice
-// reqwest's default resolver running getaddrinfo — so an OMDB DNS lookup
+// Headroom above DB_POOL_SIZE for non-DB blocking work. In practice
+// reqwest's default resolver runs getaddrinfo — so an OMDB DNS lookup
 // never queues behind DB_POOL_SIZE in-flight DB tasks. That invariant only
 // holds because http::with_conn admits DB tasks to the blocking pool through
 // a DB_POOL_SIZE-permit semaphore (excess requests wait async-side, then
@@ -63,6 +65,9 @@ enum Command {
 }
 
 fn main() {
+
+    let cli = Cli::parse();
+
     // Every DB-touching handler runs its query on a spawn_blocking thread,
     // admitted by with_conn's DB_POOL_SIZE-permit semaphore — but tokio's
     // *blocking thread pool itself* defaults to a cap of 512, independent of
@@ -73,12 +78,13 @@ fn main() {
     // pool constant, plus BLOCKING_POOL_HEADROOM (see above) for the pool's
     // other tenant, reqwest's DNS resolver.
     tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+        .enable_io()
+        .enable_time()
         .max_blocking_threads(DB_POOL_SIZE as usize + BLOCKING_POOL_HEADROOM)
         .build()
         .expect("failed to build tokio runtime")
         .block_on(async {
-            match Cli::parse().command {
+            match cli.command {
                 Command::Serve { host, port } => http::serve(host, port).await,
                 Command::Refresh {
                     db_path,

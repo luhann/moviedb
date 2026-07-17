@@ -6,8 +6,10 @@
 # Override the target with PVE_HOST=... or VMID=... in the environment.
 set -euo pipefail
 
-PVE_HOST="${PVE_HOST:-root@pve.lan}"
-VMID="${VMID:-210}"
+# pct is node-local: PVE_HOST must be whichever cluster node currently hosts
+# the container, so both defaults move together if omdb is ever migrated.
+PVE_HOST="${PVE_HOST:-root@fragment2.trusted}"
+VMID="${VMID:-401}"
 BIN="target/x86_64-unknown-linux-musl/release/moviedb"
 
 # VMID is interpolated into the remote ssh command below unquoted; reject
