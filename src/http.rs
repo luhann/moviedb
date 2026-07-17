@@ -16,7 +16,9 @@
 //! `/movies/{imdb_id}` can 404. Every POST snapshots the full ratings array
 //! into `ratings_history`, making rating drift observable, and returns the
 //! stored movie doc as JSON: 201 + `Location` if this `imdb_id` is new, 200
-//! if it already existed.
+//! if it already existed. Collection responses (`/movies`, `/movies/recent`)
+//! are bare JSON arrays; a response is an object only when it carries fields
+//! beyond the collection itself (`/history`'s `imdb_id`).
 //!
 //! Every error response is JSON `{"detail": "..."}`:
 //!   400 malformed path parameter (undecodable percent-escapes)
@@ -422,7 +424,7 @@ async fn add_movie(State(state): State<Arc<AppState>>, Params(p): Params<AddPara
             .into_response();
     }
     if error == "Movie not found!" {
-        return detail(StatusCode::NOT_FOUND, "Movie Not Found!");
+        return detail(StatusCode::NOT_FOUND, "Movie not found");
     }
     eprintln!("OMDB returned an unrecognized error for {} ({}): {error}", p.title, p.year);
     // 502: this server acted as a client to OMDB and got back an error it
@@ -536,7 +538,7 @@ async fn get_recent(
             }
             movies.push(doc);
         }
-        Json(json!({ "movies": movies })).into_response()
+        Json(movies).into_response()
     })
     .await
 }
