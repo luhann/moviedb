@@ -96,8 +96,29 @@ def main():
                 except Exception:
                     time.sleep(0.1)
 
-            s, b = req("GET", "/movies", key=None)
-            results.append(("401 without key", s == 401 and "Invalid API key" in b))
+            # Full RFC 9457 shape checked once here; the rest of the error
+            # tests only assert the members they care about.
+            s, b, headers = req_full("GET", "/movies", key=None)
+            prob = json.loads(b)
+            results.append((
+                "401 problem+json shape without key",
+                s == 401
+                and headers.get("content-type") == "application/problem+json"
+                and prob["type"] == "about:blank"
+                and prob["title"] == "Unauthorized"
+                and prob["status"] == 401
+                and "Invalid API key" in prob["detail"]))
+
+            # Unmatched paths and unsupported methods must keep the JSON
+            # error contract — axum's bare defaults are empty-bodied.
+            s, b = req("GET", "/nonexistent")
+            results.append(("404 JSON on unmatched path", s == 404 and "detail" in b))
+            s, b, headers = req_full("DELETE", "/movies")
+            results.append((
+                "405 JSON + Allow on unsupported method",
+                s == 405 and "detail" in b and "GET" in headers.get("allow", "")))
+            s, b = req("GET", "/nonexistent", key=None)
+            results.append(("401 precedes 404 on unmatched path", s == 401 and "detail" in b))
 
             s, b, headers = req_full("POST", "/movies?title=The+Matrix&rating=9/10&year=1999")
             doc = json.loads(b) if s == 201 else {}
@@ -173,11 +194,15 @@ def main():
             results.append(("422 on empty POST param", s == 422 and "non-empty" in b))
 
             # OMDB's shared daily quota being exhausted is an upstream
-            # problem, not the caller's — 503 + Retry-After, not 429.
+            # problem, not the caller's — 503 + Retry-After, not 429. The
+            # distinct problem `type` is what lets clients tell this 503
+            # from the at-capacity one without parsing `detail` prose.
             s, b, headers = req_full("POST", "/movies?title=TriggerDailyLimit&rating=1&year=2000")
+            prob = json.loads(b)
             results.append((
-                "503 + Retry-After on OMDB daily limit",
-                s == 503 and "daily request limit" in b.lower()
+                "503 + Retry-After + type URN on OMDB daily limit",
+                s == 503 and "daily request limit" in prob["detail"].lower()
+                and prob["type"] == "urn:moviedb:problem:omdb-quota-exhausted"
                 and headers.get("retry-after") == "86400"))
 
             # An OMDB error this server doesn't recognize is a bad response
@@ -211,6 +236,11 @@ def main():
                 s == 200 and isinstance(recent, list) and len(recent) == 1
                 and recent[0]["imdb_id"] == "tt0133093"
                 and recent[0]["last_refreshed"].endswith("+00:00")))
+
+            # limit=0 is a valid request for zero movies — the DB has one,
+            # so [] proves it wasn't silently promoted to limit=1.
+            s, b = req("GET", "/movies/recent?limit=0")
+            results.append(("GET /movies/recent?limit=0 -> []", s == 200 and json.loads(b) == []))
         finally:
             proc.terminate()
             proc.wait()

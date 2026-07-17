@@ -20,10 +20,18 @@
 //! are bare JSON arrays; a response is an object only when it carries fields
 //! beyond the collection itself (`/history`'s `imdb_id`).
 //!
-//! Every error response is JSON `{"detail": "..."}`:
+//! Every error response is an RFC 9457 problem-details object
+//! (`application/problem+json`): `{"type", "title", "status", "detail"}`,
+//! where `title` restates the status line and `detail` explains the
+//! occurrence. `type` is `"about:blank"` (the RFC's "the status code says it
+//! all" default) except where one status covers two distinguishable
+//! problems: the 503s carry `urn:moviedb:problem:omdb-quota-exhausted` vs
+//! `urn:moviedb:problem:at-capacity` so clients can branch without parsing
+//! `detail` prose. Statuses:
 //!   400 malformed path parameter (undecodable percent-escapes)
 //!   401 missing/invalid x-api-key
-//!   404 unknown imdb_id
+//!   404 unknown imdb_id, or a path this API doesn't serve
+//!   405 method not supported on this path (see the `Allow` header)
 //!   422 query params missing, empty, or unparseable
 //!   502 OMDB returned an error this server doesn't recognize
 //!   503 OMDB's shared daily request quota is exhausted, or all DB permits
@@ -38,7 +46,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::{FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -77,9 +85,35 @@ struct AppState {
 /// stacking up requests the client has long since given up on.
 const DB_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// RFC 9457 `type` URIs for the errors where the status code alone is
+/// ambiguous (both 503s). URNs, not URLs: there's no docs host to
+/// dereference, and the RFC only requires identity — clients compare, they
+/// don't fetch.
+const PROBLEM_OMDB_QUOTA: &str = "urn:moviedb:problem:omdb-quota-exhausted";
+const PROBLEM_AT_CAPACITY: &str = "urn:moviedb:problem:at-capacity";
+
+/// This API's error shape, used everywhere: an RFC 9457 problem-details
+/// object. `instance` is omitted — it's optional, and these helpers are
+/// called from extractors and closures that don't carry the request URI.
+fn problem(status: StatusCode, ptype: &str, msg: &str) -> Response {
+    let body = json!({
+        "type": ptype,
+        "title": status.canonical_reason().unwrap_or(""),
+        "status": status.as_u16(),
+        "detail": msg,
+    });
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/problem+json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// The common case: errors where status + detail say everything, so `type`
+/// stays "about:blank".
 fn detail(status: StatusCode, msg: &str) -> Response {
-    // This API's error shape, used everywhere: {"detail": "<msg>"}.
-    (status, Json(json!({ "detail": msg }))).into_response()
+    problem(status, "about:blank", msg)
 }
 
 /// Every caller passes a context string describing what failed, printed to
@@ -128,12 +162,14 @@ where
         // nothing here ever does.
         Ok(Err(e)) => return internal_error(format!("DB semaphore closed: {e}")),
         Err(_) => {
-            return (
+            let mut resp = problem(
                 StatusCode::SERVICE_UNAVAILABLE,
-                [(header::RETRY_AFTER, "1")],
-                Json(json!({ "detail": "Server is at capacity; try again shortly" })),
-            )
-                .into_response();
+                PROBLEM_AT_CAPACITY,
+                "Server is at capacity; try again shortly",
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return resp;
         }
     };
     let pool = state.db.clone();
@@ -182,9 +218,11 @@ struct FilterParams {
     year: Option<String>,
 }
 
-/// `GET /movies/recent`'s only param. Missing/unparseable means
-/// `DEFAULT_RECENT_LIMIT`; anything above `MAX_RECENT_LIMIT` is clamped, not
-/// rejected — same defensive posture as every other collection endpoint.
+/// `GET /movies/recent`'s only param. Missing means `DEFAULT_RECENT_LIMIT`
+/// (unparseable is a 422 from `Params`, like any bad query param); anything
+/// above `MAX_RECENT_LIMIT` is clamped, not rejected — same defensive
+/// posture as every other collection endpoint. `limit=0` is a valid request
+/// for zero movies and returns `[]`, not a silent promotion to 1.
 #[derive(Deserialize)]
 struct RecentParams {
     limit: Option<usize>,
@@ -416,12 +454,14 @@ async fn add_movie(State(state): State<Arc<AppState>>, Params(p): Params<AddPara
         // later", as opposed to "you personally are being rate-limited".
         // Retry-After is a conservative fixed 24h; OMDB doesn't document
         // exactly when its daily counter resets.
-        return (
+        let mut resp = problem(
             StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, "86400")],
-            Json(json!({ "detail": "OMDB's daily request limit is exhausted; try again later" })),
-        )
-            .into_response();
+            PROBLEM_OMDB_QUOTA,
+            "OMDB's daily request limit is exhausted; try again later",
+        );
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("86400"));
+        return resp;
     }
     if error == "Movie not found!" {
         return detail(StatusCode::NOT_FOUND, "Movie not found");
@@ -500,7 +540,7 @@ async fn get_recent(
     State(state): State<Arc<AppState>>,
     Params(p): Params<RecentParams>,
 ) -> Response {
-    let limit = p.limit.unwrap_or(DEFAULT_RECENT_LIMIT).clamp(1, MAX_RECENT_LIMIT);
+    let limit = p.limit.unwrap_or(DEFAULT_RECENT_LIMIT).min(MAX_RECENT_LIMIT);
     with_conn(&state, move |conn| {
         let result = (|| -> rusqlite::Result<Vec<(String, String)>> {
             let mut stmt = conn.prepare(
@@ -603,6 +643,18 @@ async fn get_history(State(state): State<Arc<AppState>>, ImdbId(imdb_id): ImdbId
     .await
 }
 
+/// axum's built-in responses for an unmatched path (404) and a matched path
+/// with an unsupported method (405) have empty bodies — these two replace
+/// them so the `{"detail": ...}` contract holds on every error, not just the
+/// handler-level ones. axum still sets the `Allow` header on the 405.
+async fn fallback_not_found() -> Response {
+    detail(StatusCode::NOT_FOUND, "Not Found")
+}
+
+async fn fallback_method_not_allowed() -> Response {
+    detail(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
+}
+
 /// Resolves when SIGTERM (systemctl stop/restart, pct shutdown) or SIGINT
 /// (^C in a terminal) arrives; axum then stops accepting, drains in-flight
 /// requests, and returns — instead of the default of the signal killing the
@@ -663,6 +715,10 @@ pub(crate) async fn serve(host: String, port: u16) {
         .route("/movies/recent", get(get_recent))
         .route("/movies/{imdb_id}", get(get_movie))
         .route("/movies/{imdb_id}/history", get(get_history))
+        // Registered before the auth layer so unknown paths and wrong
+        // methods still answer 401 first without a valid key.
+        .fallback(fallback_not_found)
+        .method_not_allowed_fallback(fallback_method_not_allowed)
         .layer(middleware::from_fn_with_state(state.clone(), check_key))
         .with_state(state);
 

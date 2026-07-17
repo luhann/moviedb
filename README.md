@@ -30,12 +30,17 @@ non-unique key, multiple/zero matches are data, not errors. Only
 `/movies/recent`) are bare JSON arrays; a response is an object only when it
 carries fields beyond the collection itself (`/history`'s `imdb_id`).
 
-Errors are `{"detail": "..."}` with a standard HTTP status: 400 (malformed
-path parameter), 401 (bad/missing `x-api-key`), 404 (unknown `imdb_id`),
-422 (query params missing/empty/unparseable), 502/503 (OMDB returned
-something unrecognized / its daily quota is exhausted or the server is
-briefly out of DB capacity — both 503s carry `Retry-After`), 500 (internal
-error).
+Errors are RFC 9457 problem-details objects (`application/problem+json`,
+members `type`/`title`/`status`/`detail`) with a standard HTTP status: 400
+(malformed path parameter), 401 (bad/missing `x-api-key`), 404 (unknown
+`imdb_id` or unmatched path), 405 (wrong method, with `Allow`), 422 (query
+params missing/empty/unparseable), 502/503 (OMDB returned something
+unrecognized / its daily quota is exhausted or the server is briefly out of
+DB capacity — both 503s carry `Retry-After`), 500 (internal error). `type`
+is `about:blank` except for the two 503s, which carry
+`urn:moviedb:problem:omdb-quota-exhausted` vs
+`urn:moviedb:problem:at-capacity` so clients can tell them apart without
+parsing `detail`.
 
 ## Build
 
@@ -133,10 +138,10 @@ Up to you. I use [traefik](https://github.com/traefik/traefik) as my reverse pro
   imdb_id is new, 200 if it already existed), not the Lambda's bare-title
   plain-text body.
 - **`year` is required on POST**; the Lambda threw a KeyError (502) if
-  omitted, this returns a clean 422 JSON `{"detail": ...}` (axum's query
+  omitted, this returns a clean 422 problem-details body (axum's query
   rejection, normalized to this API's error shape).
-- **No trailing slashes**: `/movies/` is an unmatched route (empty 404), not
-  a redirect to `/movies`. FastAPI 307-redirected these, which `curl -L`
+- **No trailing slashes**: `/movies/` is an unmatched route (a problem-JSON
+  404), not a redirect to `/movies`. FastAPI 307-redirected these, which `curl -L`
   followed silently; axum matches exactly. Slashless resource paths are the
   API convention — fix the URL, not the router.
 - **Ratings history**: every POST and refresh appends one row per rating
