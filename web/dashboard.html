@@ -1,0 +1,1759 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>moviedb — ledger</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --ink-muted:   #898781;
+    --grid:        #e1e0d9;
+    --baseline:    #c3c2b7;
+    --border:      rgba(11,11,11,0.10);
+    --border-2:    rgba(11,11,11,0.16);
+
+    --accent:      #2a78d6;   /* blue — "you" / sequential / personal series */
+    --accent-soft: rgba(42,120,214,0.12);
+    --imdb:        #eda100;   /* yellow */
+    --rt:          #e87ba4;   /* magenta */
+    --mc:          #008300;   /* green */
+    --diverge-neg: #e34948;   /* red — critics rated higher */
+    --diverge-mid: #f0efec;
+
+    --good:        #006300;
+    --critical:    #d03b3b;
+    --warning:     #fab219;
+
+    --font-display: ui-serif, "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas, monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:        #0d0d0d;
+      --surface:     #1a1a19;
+      --ink:         #ffffff;
+      --ink-2:       #c3c2b7;
+      --ink-muted:   #898781;
+      --grid:        #2c2c2a;
+      --baseline:    #383835;
+      --border:      rgba(255,255,255,0.10);
+      --border-2:    rgba(255,255,255,0.16);
+      --accent:      #3987e5;
+      --accent-soft: rgba(57,135,229,0.16);
+      --imdb:        #c98500;
+      --rt:          #d55181;
+      --mc:          #008300;
+      --diverge-neg: #e66767;
+      --diverge-mid: #383835;
+      --good:        #0ca30c;
+      --critical:    #d03b3b;
+      --warning:     #fab219;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:        #0d0d0d;
+    --surface:     #1a1a19;
+    --ink:         #ffffff;
+    --ink-2:       #c3c2b7;
+    --ink-muted:   #898781;
+    --grid:        #2c2c2a;
+    --baseline:    #383835;
+    --border:      rgba(255,255,255,0.10);
+    --border-2:    rgba(255,255,255,0.16);
+    --accent:      #3987e5;
+    --accent-soft: rgba(57,135,229,0.16);
+    --imdb:        #c98500;
+    --rt:          #d55181;
+    --mc:          #008300;
+    --diverge-neg: #e66767;
+    --diverge-mid: #383835;
+    --good:        #0ca30c;
+    --critical:    #d03b3b;
+    --warning:     #fab219;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 40px 28px 80px;
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+  }
+  /* Flex/grid items default to min-width:auto, not 0 — meaning they won't
+     shrink below their content's natural minimum width even when told to
+     stretch to a narrower container. On a phone viewport, that lets a
+     nowrap label or a wide table quietly force every ancestor (this column
+     of panels, then body) wider than the screen, so the whole page scrolls
+     sideways instead of just the one element that's actually too wide. */
+  .wrap > * { min-width: 0; }
+
+  /* ---------- header ---------- */
+  header.masthead {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding-bottom: 18px;
+    border-bottom: 2px solid var(--ink);
+  }
+  .wordmark { display: flex; align-items: baseline; gap: 14px; }
+  .wordmark h1 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 30px;
+    letter-spacing: 0.01em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .wordmark .tagline {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-muted);
+    letter-spacing: 0.02em;
+  }
+  .meta-stamp {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--ink-muted);
+    text-align: right;
+    line-height: 1.6;
+    letter-spacing: 0.03em;
+  }
+  .meta-stamp .dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--good);
+    margin-right: 6px;
+  }
+  .meta-stamp button {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    background: none;
+    border: 1px solid var(--border-2);
+    color: var(--ink-muted);
+    padding: 3px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    margin-top: 4px;
+  }
+  .meta-stamp button:hover { color: var(--ink); border-color: var(--ink-muted); }
+
+  /* ---------- stat tiles ---------- */
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+  }
+  .stat-tile {
+    background: var(--surface);
+    padding: 18px 20px;
+    background-image: repeating-linear-gradient(
+      to bottom, transparent, transparent 20px, var(--border) 20px, var(--border) 21px
+    );
+    background-position: 0 44px;
+  }
+  .stat-tile .label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-muted);
+  }
+  .stat-tile .value {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 30px;
+    font-weight: 600;
+    margin-top: 6px;
+    letter-spacing: -0.01em;
+  }
+  .stat-tile .value small {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--ink-muted);
+    margin-left: 3px;
+  }
+  .stat-tile .sub { font-family: var(--font-sans); font-size: 12px; color: var(--ink-2); margin-top: 4px; }
+
+  /* ---------- panels ---------- */
+  /* minmax(0, ...) not bare fr — a bare `1fr` track defaults to
+     minmax(auto, 1fr), so wide content inside one column (the ledger
+     table, the wide scatter charts) stops the whole track from shrinking
+     on a narrow viewport. Same root cause as the .wrap > * rule above. */
+  .grid-2 { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr); gap: 20px; }
+  .grid-2b { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+  .panel { background: var(--surface); border: 1px solid var(--border); padding: 20px 22px 18px; min-width: 0; }
+  .panel-head {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    gap: 12px; margin-bottom: 4px; min-width: 0;
+  }
+  .panel-head > div:first-child { min-width: 0; }
+  .panel-head h2 { font-family: var(--font-display); font-size: 17px; font-weight: 600; margin: 0; }
+  .panel-head .note { font-family: var(--font-sans); font-size: 12px; color: var(--ink-2); margin: 3px 0 0; max-width: 46ch; }
+  .panel-head .index {
+    font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-muted);
+    letter-spacing: 0.06em; white-space: nowrap; padding-top: 3px;
+  }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0 6px; }
+  .legend-item {
+    display: flex; align-items: center; gap: 6px;
+    font-family: var(--font-mono); font-size: 11px; color: var(--ink-2); letter-spacing: 0.02em;
+  }
+  .legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  .legend-line { width: 14px; height: 2px; flex: none; }
+
+  select.drift-select {
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--border-2);
+    border-radius: 3px;
+    padding: 5px 8px;
+    max-width: 100%;
+  }
+
+  svg.chart { display: block; width: 100%; height: auto; overflow: visible; }
+  svg text { font-family: var(--font-mono); fill: var(--ink-2); }
+  .bar-label { font-family: var(--font-mono); font-size: 11px; fill: var(--ink-2); }
+  .row-label { font-family: var(--font-sans); font-size: 12px; fill: var(--ink); }
+  .axis-tick { font-family: var(--font-mono); font-size: 10px; fill: var(--ink-muted); }
+
+  .hit { cursor: pointer; }
+  .hit:hover { filter: brightness(1.12); }
+
+  .sr-only {
+    position: absolute; width: 1px; height: 1px;
+    padding: 0; margin: -1px; overflow: hidden;
+    clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+
+  .empty-state {
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    color: var(--ink-muted);
+    padding: 28px 4px;
+    text-align: center;
+  }
+
+  #tooltip {
+    position: fixed;
+    pointer-events: none;
+    background: var(--ink);
+    color: var(--page);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    padding: 7px 10px;
+    border-radius: 3px;
+    opacity: 0;
+    transform: translate(-50%, calc(-100% - 10px));
+    transition: opacity 0.08s ease;
+    z-index: 50;
+    white-space: nowrap;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+  }
+  #tooltip.show { opacity: 1; }
+  #tooltip b { font-weight: 700; }
+
+  /* ---------- table ---------- */
+  /* On narrow viewports the 5-column table is wider than the panel — this
+     lets the table itself scroll horizontally instead of the whole page
+     (which is what was happening on mobile: the table pushed the page's
+     own width out, so everything scrolled sideways, not just the table). */
+  #ledgerWrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table.ledger { width: 100%; min-width: 480px; border-collapse: collapse; font-size: 13px; }
+  table.ledger th {
+    text-align: left; font-family: var(--font-mono); font-size: 10.5px;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-muted);
+    font-weight: 500; padding: 0 10px 8px; border-bottom: 1px solid var(--border-2);
+  }
+  table.ledger td { padding: 10px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  table.ledger tr:last-child td { border-bottom: none; }
+  table.ledger td.num, table.ledger th.num {
+    font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right;
+  }
+  .title-cell .t { font-weight: 600; }
+  .title-cell .g { color: var(--ink-muted); font-size: 11.5px; margin-left: 6px; }
+  .delta-up { color: var(--good); }
+  .delta-down { color: var(--critical); }
+  .chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.04em;
+    padding: 2px 6px; border-radius: 3px; border: 1px solid var(--border-2); color: var(--ink-muted);
+  }
+  .chip.stale { color: var(--warning); border-color: var(--warning); }
+  .chip.stale::before { content: "●"; font-size: 8px; }
+
+  footer.foot {
+    font-family: var(--font-mono); font-size: 11px; color: var(--ink-muted);
+    padding-top: 8px; border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+  }
+
+  /* ---------- key prompt ---------- */
+  #keyOverlay {
+    position: fixed; inset: 0; background: color-mix(in srgb, var(--page) 88%, transparent);
+    backdrop-filter: blur(2px);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100; padding: 20px;
+  }
+  #keyOverlay[hidden] { display: none; }
+  .key-card {
+    background: var(--surface); border: 1px solid var(--border-2);
+    padding: 26px 28px; max-width: 380px; width: 100%;
+  }
+  .key-card h2 { font-family: var(--font-display); font-size: 18px; margin: 0 0 8px; }
+  .key-card p { font-family: var(--font-sans); font-size: 12.5px; color: var(--ink-2); line-height: 1.6; margin: 0 0 16px; }
+  .key-card input {
+    width: 100%; font-family: var(--font-mono); font-size: 13px;
+    padding: 8px 10px; border: 1px solid var(--border-2); border-radius: 3px;
+    background: var(--page); color: var(--ink); margin-bottom: 10px;
+  }
+  .key-card button {
+    font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.03em;
+    background: var(--accent); color: white; border: none;
+    padding: 9px 14px; border-radius: 3px; cursor: pointer; width: 100%;
+  }
+  .key-card .err { color: var(--critical); font-size: 12px; font-family: var(--font-sans); margin: 8px 0 0; min-height: 1em; }
+
+  /* ---------- add-title form ---------- */
+  .add-form {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 10px;
+  }
+  .add-form .field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .add-form label {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-muted);
+  }
+  .add-form input {
+    font-family: var(--font-sans);
+    font-size: 13px;
+    padding: 8px 10px;
+    border: 1px solid var(--border-2);
+    border-radius: 3px;
+    background: var(--page);
+    color: var(--ink);
+  }
+  .add-form input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .add-form #addTitle { flex: 1; min-width: 200px; }
+  .add-form #addYear { width: 90px; }
+  .add-form #addRating { width: 90px; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .add-form button {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0.03em;
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: 9px 16px;
+    border-radius: 3px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .add-form button:disabled { opacity: 0.6; cursor: default; }
+  .add-form-status {
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    margin-top: 10px;
+    min-height: 1.2em;
+  }
+  .add-form-status.ok { color: var(--good); }
+  .add-form-status.err { color: var(--critical); }
+
+  /* ---------- title inspector ---------- */
+  .detail {
+    display: grid;
+    grid-template-columns: 150px minmax(0, 1fr);
+    gap: 24px;
+    margin-top: 16px;
+  }
+  .detail-poster, .detail-poster-missing {
+    width: 150px;
+    aspect-ratio: 2 / 3;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    background: var(--page);
+  }
+  .detail-poster { display: block; object-fit: cover; }
+  .detail-poster-missing {
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono); font-size: 10.5px;
+    letter-spacing: 0.06em; color: var(--ink-muted);
+  }
+  .detail-body { min-width: 0; }
+  .detail-body h3 {
+    font-family: var(--font-display); font-size: 22px; font-weight: 600;
+    margin: 0; text-wrap: balance;
+  }
+  .detail-body .sub-line {
+    font-family: var(--font-mono); font-size: 11.5px;
+    letter-spacing: 0.03em; color: var(--ink-muted); margin-top: 5px;
+  }
+  .detail-body .plot {
+    font-size: 13.5px; line-height: 1.65; color: var(--ink-2);
+    margin: 14px 0 0; max-width: 70ch;
+  }
+  .meters {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 12px 20px; margin-top: 18px;
+  }
+  .meter .m-head {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+    font-family: var(--font-mono); font-size: 10.5px;
+    text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-muted);
+  }
+  .meter .m-head .m-raw {
+    font-variant-numeric: tabular-nums; text-transform: none;
+    letter-spacing: 0.02em; color: var(--ink);
+  }
+  .meter .m-track {
+    height: 6px; border-radius: 3px; background: var(--grid);
+    margin-top: 6px; overflow: hidden;
+  }
+  .meter .m-fill { height: 100%; border-radius: 3px; }
+  dl.facts {
+    display: grid; grid-template-columns: max-content minmax(0, 1fr);
+    gap: 7px 18px; margin: 20px 0 0; font-size: 13px;
+  }
+  dl.facts dt {
+    font-family: var(--font-mono); font-size: 10.5px;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--ink-muted); padding-top: 2px;
+  }
+  dl.facts dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+  dl.facts dd a { color: var(--accent); }
+
+  @media (max-width: 860px) {
+    .stat-row { grid-template-columns: repeat(2, 1fr); }
+    .grid-2, .grid-2b { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .detail { grid-template-columns: 1fr; gap: 16px; }
+    dl.facts { grid-template-columns: 1fr; gap: 2px 0; }
+    dl.facts dd { margin-bottom: 8px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="wordmark">
+      <h1>moviedb</h1>
+      <span class="tagline">a private film ledger, refreshed monthly</span>
+    </div>
+    <div class="meta-stamp">
+      <div><span class="dot"></span><span id="statusLine">connecting…</span></div>
+      <button id="forgetKeyBtn" type="button">forget key</button>
+    </div>
+  </header>
+
+  <section class="stat-row">
+    <div class="stat-tile">
+      <div class="label">Titles catalogued</div>
+      <div class="value" id="statCount">—</div>
+      <div class="sub" id="statCountSub"></div>
+    </div>
+    <div class="stat-tile">
+      <div class="label">Avg. personal rating</div>
+      <div class="value" id="statAvgPersonal">—</div>
+      <div class="sub">out of 100</div>
+    </div>
+    <div class="stat-tile">
+      <div class="label">Avg. delta vs IMDb</div>
+      <div class="value" id="statAvgDelta">—</div>
+      <div class="sub" id="statAvgDeltaSub"></div>
+    </div>
+    <div class="stat-tile">
+      <div class="label">Decades spanned</div>
+      <div class="value" id="statDecades">—</div>
+      <div class="sub" id="statDecadesSub"></div>
+    </div>
+  </section>
+
+  <section class="grid-2">
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Verdict divergence</h2>
+          <p class="note">Your rating minus IMDb's (both indexed to /100), ranked by how far apart you landed.</p>
+        </div>
+        <div class="index">01 / personal − imdb</div>
+      </div>
+      <div class="legend">
+        <span class="legend-item"><span class="legend-swatch" style="background:var(--accent)"></span>you rated higher</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:var(--diverge-neg)"></span>critics rated higher</span>
+      </div>
+      <div id="divergeWrap"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Rating drift</h2>
+          <p class="note" id="driftNote">Every score logged since first catalogued, indexed to /100.</p>
+        </div>
+        <div class="index">02 / ratings_history</div>
+      </div>
+      <label for="driftSelect" class="sr-only">Title to show rating drift for</label>
+      <select class="drift-select" id="driftSelect"></select>
+      <div class="legend" id="driftLegend"></div>
+      <div id="driftWrap"></div>
+    </div>
+  </section>
+
+  <section class="grid-2b">
+    <div class="panel">
+      <div class="panel-head">
+        <div><h2>By genre</h2><p class="note">Primary genre, whole collection.</p></div>
+        <div class="index">03 / genre</div>
+      </div>
+      <div id="genreWrap"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div><h2>By decade</h2><p class="note">Release decade, whole collection.</p></div>
+        <div class="index">04 / decade</div>
+      </div>
+      <div id="decadeWrap"></div>
+    </div>
+  </section>
+
+  <section class="grid-2b">
+    <div class="panel">
+      <div class="panel-head">
+        <div><h2>Most-watched director</h2><p class="note">Primary (first-listed) director, whole collection.</p></div>
+        <div class="index">05 / director</div>
+      </div>
+      <div id="directorWrap"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div><h2>By content rating</h2><p class="note" id="ratedNote">Average personal score by MPAA rating.</p></div>
+        <div class="index">06 / rated</div>
+      </div>
+      <div id="ratedWrap"></div>
+    </div>
+  </section>
+
+  <section class="grid-2b">
+    <div class="panel">
+      <div class="panel-head">
+        <div><h2>Runtime vs. your rating</h2><p class="note" id="runtimeNote">Does a longer runtime earn a higher score?</p></div>
+        <div class="index">07 / runtime</div>
+      </div>
+      <div id="runtimeWrap"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div><h2>Box office by decade</h2><p class="note">Average reported box office, release decade — raw dollars, not inflation-adjusted.</p></div>
+        <div class="index">08 / box_office</div>
+      </div>
+      <div id="boxOfficeWrap"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div><h2>Release year vs. runtime</h2><p class="note" id="yearRuntimeNote">Has runtime crept up over the decades?</p></div>
+      <div class="index">09 / year_runtime</div>
+    </div>
+    <div id="yearRuntimeWrap"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div><h2>Recently catalogued</h2><p class="note">Latest refreshes, most recent first.</p></div>
+      <div class="index">10 / movies/recent</div>
+    </div>
+    <div id="ledgerWrap"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div><h2>Title inspector</h2><p class="note">Everything catalogued for one title, straight from its stored document.</p></div>
+      <div class="index">11 / movies</div>
+    </div>
+    <label for="detailSelect" class="sr-only">Title to inspect</label>
+    <select class="drift-select" id="detailSelect"></select>
+    <div id="detailWrap"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div><h2>Add a title</h2><p class="note">Fetches OMDb, catalogues it, and snapshots the rating — same POST /movies as re-rating an existing title updates it.</p></div>
+      <div class="index">12 / movies</div>
+    </div>
+    <form class="add-form" id="addForm">
+      <div class="field">
+        <label for="addTitle">Title</label>
+        <input type="text" id="addTitle" name="title" required autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="addYear">Year</label>
+        <input type="text" id="addYear" name="year" placeholder="2008" required autocomplete="off" inputmode="numeric">
+      </div>
+      <div class="field">
+        <label for="addRating">Personal /100</label>
+        <input type="number" id="addRating" name="rating" min="0" max="100" required autocomplete="off">
+      </div>
+      <button type="submit" id="addSubmit">Add to ledger</button>
+    </form>
+    <p class="add-form-status" id="addStatus"></p>
+  </section>
+
+  <footer class="foot">
+    <span>GET/POST /movies · GET /movies/recent · GET /movies/{imdb_id} · GET /movies/{imdb_id}/history</span>
+    <span id="footRefreshNote"></span>
+  </footer>
+
+</div>
+
+<div id="tooltip"></div>
+
+<div id="keyOverlay" hidden>
+  <div class="key-card">
+    <h2>Connect</h2>
+    <p>This dashboard talks straight to the moviedb API on this origin. Your key stays in this browser's local storage — it's sent only as the <code>x-api-key</code> header on requests to this same host.</p>
+    <input id="keyInput" type="password" placeholder="API key" autocomplete="off" spellcheck="false">
+    <button id="keySubmit" type="button">Connect</button>
+    <p class="err" id="keyErr"></p>
+  </div>
+</div>
+
+<script>
+(function () {
+  const NS = "http://www.w3.org/2000/svg";
+  const KEY_STORAGE = "moviedb_api_key";
+  const STALE_DAYS = 45; // 1.5x the monthly refresh cadence
+
+  const SOURCE = {
+    PERSONAL: "Personal",
+    IMDB: "Internet Movie Database",
+    RT: "Rotten Tomatoes",
+    MC: "Metacritic",
+  };
+  const SOURCE_LABEL = {
+    [SOURCE.PERSONAL]: "Personal",
+    [SOURCE.IMDB]: "IMDb",
+    [SOURCE.RT]: "Rotten Tomatoes",
+    [SOURCE.MC]: "Metacritic",
+  };
+  // Used only for the drift chart's endpoint labels — the plot is narrow
+  // enough that "Rotten Tomatoes" at the right edge runs past the panel.
+  // Legend and tooltips still use the full SOURCE_LABEL names.
+  const SOURCE_SHORT_LABEL = {
+    [SOURCE.PERSONAL]: "You",
+    [SOURCE.IMDB]: "IMDb",
+    [SOURCE.RT]: "RT",
+    [SOURCE.MC]: "MC",
+  };
+  const SOURCE_COLOR_VAR = {
+    [SOURCE.PERSONAL]: "--accent",
+    [SOURCE.IMDB]: "--imdb",
+    [SOURCE.RT]: "--rt",
+    [SOURCE.MC]: "--mc",
+  };
+  const SOURCE_ORDER = [SOURCE.PERSONAL, SOURCE.IMDB, SOURCE.RT, SOURCE.MC];
+
+  function cssVar(name) { return getComputedStyle(document.body).getPropertyValue(name).trim(); }
+
+  function el(tag, attrs) {
+    const n = document.createElementNS(NS, tag);
+    for (const k in attrs) n.setAttribute(k, attrs[k]);
+    return n;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function emptyState(node, msg) {
+    clear(node);
+    const p = document.createElement("div");
+    p.className = "empty-state";
+    p.textContent = msg;
+    node.appendChild(p);
+  }
+
+  /* ---------------- parsing helpers ---------------- */
+  function ratingBySource(ratings, source) {
+    if (!Array.isArray(ratings)) return null;
+    const hit = ratings.find((r) => r && r.source === source);
+    return hit ? hit.value : null;
+  }
+  // Titles/genres come from OMDb, not this app — "Dungeons & Dragons: Honor
+  // Among Thieves" or a title with an apostrophe/`<` would corrupt the
+  // markup (or worse) wherever they're interpolated into an innerHTML
+  // template. Every such interpolation goes through this first.
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  // The divergence chart's row labels have a fixed-width column to their
+  // left — an unclipped long title runs off the left edge of the panel.
+  // The tooltip (wired separately) always gets the untruncated title.
+  function truncate(str, maxLen) {
+    return str.length > maxLen ? str.slice(0, maxLen - 1).trimEnd() + "…" : str;
+  }
+  function parseNumber(raw) {
+    if (raw == null || raw === "N/A") return null;
+    const n = parseFloat(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+  // Every source normalized to a common /100 score. Personal ratings are
+  // always entered out of 100; IMDb is the only source needing rescale.
+  function normalizedRating(ratings, source) {
+    const n = parseNumber(ratingBySource(ratings, source));
+    if (n === null) return null;
+    return source === SOURCE.IMDB ? n * 10 : n;
+  }
+  function primaryGenre(movie) {
+    if (!movie.genre || movie.genre === "N/A") return null;
+    return movie.genre.split(",")[0].trim();
+  }
+  function releaseYear(movie) {
+    const m = /\d{4}/.exec(movie.year || "");
+    return m ? parseInt(m[0], 10) : null;
+  }
+  function primaryDirector(movie) {
+    if (!movie.director || movie.director === "N/A") return null;
+    return movie.director.split(",")[0].trim();
+  }
+  function parseRuntime(movie) {
+    const m = /\d+/.exec(movie.runtime || "");
+    return m ? parseInt(m[0], 10) : null;
+  }
+  function parseBoxOffice(movie) {
+    if (!movie.box_office || movie.box_office === "N/A") return null;
+    const n = parseFloat(movie.box_office.replace(/[$,]/g, ""));
+    return Number.isFinite(n) ? n : null;
+  }
+  const MPAA_ORDER = ["G", "PG", "PG-13", "R", "NC-17"];
+  // Anything outside the five standard MPAA tiers (Not Rated, TV-*, N/A,
+  // foreign classifications OMDb passes through as-is) folds into one
+  // bucket rather than a long tail of one-off values.
+  function mpaaBucket(movie) {
+    return MPAA_ORDER.includes(movie.rated) ? movie.rated : "Other";
+  }
+  function fmtMoney(n) {
+    if (n >= 1e9) return "$" + (n / 1e9).toFixed(1) + "B";
+    if (n >= 1e6) return "$" + (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return "$" + (n / 1e3).toFixed(0) + "K";
+    return "$" + n.toFixed(0);
+  }
+  // Pearson correlation coefficient — the single number that answers
+  // "does a longer runtime earn a higher score" without making the reader
+  // eyeball 179 overlapping dots for a trend that may not be there.
+  function pearsonR(xs, ys) {
+    const n = xs.length;
+    const meanX = xs.reduce((a, b) => a + b, 0) / n;
+    const meanY = ys.reduce((a, b) => a + b, 0) / n;
+    let cov = 0, varX = 0, varY = 0;
+    for (let i = 0; i < n; i++) {
+      const dx = xs[i] - meanX, dy = ys[i] - meanY;
+      cov += dx * dy; varX += dx * dx; varY += dy * dy;
+    }
+    return varX === 0 || varY === 0 ? 0 : cov / Math.sqrt(varX * varY);
+  }
+  function linearFit(xs, ys) {
+    const n = xs.length;
+    const meanX = xs.reduce((a, b) => a + b, 0) / n;
+    const meanY = ys.reduce((a, b) => a + b, 0) / n;
+    let num = 0, den = 0;
+    for (let i = 0; i < n; i++) {
+      num += (xs[i] - meanX) * (ys[i] - meanY);
+      den += (xs[i] - meanX) * (xs[i] - meanX);
+    }
+    const slope = den === 0 ? 0 : num / den;
+    return { slope, intercept: meanY - slope * meanX };
+  }
+  // d.toFixed(0) on e.g. -0.3 prints "-0" (JS preserves the sign of a
+  // negative value that rounds to zero) — round first so the sign check
+  // and the printed digits agree.
+  function fmtDelta(d) {
+    const rounded = Math.round(d);
+    return (rounded > 0 ? "+" : "") + rounded;
+  }
+  function fmtDate(iso) {
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    return d.toISOString().slice(0, 10);
+  }
+  // Axis ticks need a granularity matched to the actual spread of data —
+  // three refresh snapshots a week apart all render as "2026-07" under a
+  // fixed year-month format, which is technically correct and useless.
+  function formatAxisDate(t, spanMs) {
+    const d = new Date(t);
+    const DAY = 86400000;
+    if (spanMs < 90 * DAY) return d.toISOString().slice(5, 10); // MM-DD
+    if (spanMs < 3 * 365 * DAY) return d.toISOString().slice(0, 7); // YYYY-MM
+    return d.toISOString().slice(0, 4); // YYYY
+  }
+  function isStale(iso) {
+    const d = new Date(iso);
+    if (isNaN(d)) return false;
+    return (Date.now() - d.getTime()) / 86400000 > STALE_DAYS;
+  }
+
+  /* ---------------- auth + fetch ---------------- */
+  const overlay = document.getElementById("keyOverlay");
+  const keyInput = document.getElementById("keyInput");
+  const keyErr = document.getElementById("keyErr");
+  const statusLine = document.getElementById("statusLine");
+
+  function getKey() { return localStorage.getItem(KEY_STORAGE) || ""; }
+  function showKeyPrompt(message) {
+    keyErr.textContent = message || "";
+    overlay.hidden = false;
+    keyInput.focus();
+  }
+  function hideKeyPrompt() { overlay.hidden = true; }
+
+  async function apiFetch(path) {
+    const res = await fetch(path, { headers: { "x-api-key": getKey() } });
+    if (res.status === 401) {
+      localStorage.removeItem(KEY_STORAGE);
+      showKeyPrompt("That key was rejected — try again.");
+      throw new Error("unauthorized");
+    }
+    if (!res.ok) throw new Error("request to " + path + " failed: " + res.status);
+    return res.json();
+  }
+
+  // Unlike apiFetch, callers here need the real server error (title not
+  // found, OMDb quota exhausted, ...) to show the user, not just a generic
+  // failure — so this reports status/body back instead of throwing on a
+  // non-401 error.
+  async function apiPost(path) {
+    const res = await fetch(path, { method: "POST", headers: { "x-api-key": getKey() } });
+    if (res.status === 401) {
+      localStorage.removeItem(KEY_STORAGE);
+      showKeyPrompt("That key was rejected — try again.");
+      throw new Error("unauthorized");
+    }
+    let body = null;
+    try { body = await res.json(); } catch (e) { /* no/invalid JSON body */ }
+    return { ok: res.ok, status: res.status, body };
+  }
+
+  document.getElementById("keySubmit").addEventListener("click", submitKey);
+  keyInput.addEventListener("keydown", (e) => { if (e.key === "Enter") submitKey(); });
+  function submitKey() {
+    const v = keyInput.value.trim();
+    if (!v) return;
+    localStorage.setItem(KEY_STORAGE, v);
+    hideKeyPrompt();
+    boot();
+  }
+  document.getElementById("forgetKeyBtn").addEventListener("click", () => {
+    localStorage.removeItem(KEY_STORAGE);
+    showKeyPrompt("");
+  });
+
+  document.getElementById("addForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const title = document.getElementById("addTitle").value.trim();
+    const year = document.getElementById("addYear").value.trim();
+    const rating = document.getElementById("addRating").value.trim();
+    if (!title || !year || !rating) return;
+
+    const submitBtn = document.getElementById("addSubmit");
+    const status = document.getElementById("addStatus");
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Adding…";
+    status.textContent = "";
+    status.className = "add-form-status";
+
+    try {
+      const params = new URLSearchParams({ title, year, rating });
+      const { ok, status: httpStatus, body } = await apiPost("/movies?" + params.toString());
+      if (ok) {
+        const docTitle = (body && body.title) || title;
+        const docYear = (body && body.year) || year;
+        status.textContent = httpStatus === 201
+          ? `Added "${docTitle}" (${docYear}) to the ledger.`
+          : `"${docTitle}" (${docYear}) was already catalogued — rating updated.`;
+        status.className = "add-form-status ok";
+        document.getElementById("addForm").reset();
+        boot(); // re-fetch + re-render everything so the new/updated title shows up immediately
+      } else {
+        status.textContent = (body && body.detail) || `Request failed (${httpStatus}).`;
+        status.className = "add-form-status err";
+      }
+    } catch (err) {
+      if (err.message !== "unauthorized") {
+        status.textContent = "Couldn't reach the API — try again.";
+        status.className = "add-form-status err";
+      }
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Add to ledger";
+    }
+  });
+
+  /* ---------------- tooltip ---------------- */
+  const tooltip = document.getElementById("tooltip");
+  function showTip(evt, html) {
+    tooltip.innerHTML = html;
+    tooltip.style.left = evt.clientX + "px";
+    tooltip.style.top = evt.clientY + "px";
+    tooltip.classList.add("show");
+  }
+  function hideTip() { tooltip.classList.remove("show"); }
+  function wire(node, html) {
+    node.addEventListener("mousemove", (e) => showTip(e, html));
+    node.addEventListener("mouseleave", hideTip);
+  }
+
+  /* ---------------- stat tiles ---------------- */
+  function renderStats(movies) {
+    document.getElementById("statCount").textContent = movies.length;
+    const years = movies.map(releaseYear).filter((y) => y !== null);
+    document.getElementById("statCountSub").textContent =
+      years.length ? Math.min(...years) + " – " + Math.max(...years) : "no titles yet";
+
+    const personalVals = movies
+      .map((m) => normalizedRating(m.ratings, SOURCE.PERSONAL))
+      .filter((v) => v !== null);
+    document.getElementById("statAvgPersonal").innerHTML = personalVals.length
+      ? (personalVals.reduce((a, b) => a + b, 0) / personalVals.length).toFixed(0) + "<small>/100</small>"
+      : "—";
+
+    const deltas = movies
+      .map((m) => {
+        const p = normalizedRating(m.ratings, SOURCE.PERSONAL);
+        const i = normalizedRating(m.ratings, SOURCE.IMDB);
+        return p !== null && i !== null ? p - i : null;
+      })
+      .filter((v) => v !== null);
+    const avgDeltaEl = document.getElementById("statAvgDelta");
+    if (deltas.length) {
+      const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length;
+      avgDeltaEl.textContent = fmtDelta(avg);
+      avgDeltaEl.style.color = avg >= 0 ? "var(--good)" : "var(--critical)";
+      document.getElementById("statAvgDeltaSub").textContent =
+        avg >= 0 ? "you run warmer than IMDb, on average" : "IMDb runs warmer than you, on average";
+    } else {
+      avgDeltaEl.textContent = "—";
+      document.getElementById("statAvgDeltaSub").textContent = "no comparable titles yet";
+    }
+
+    const decades = new Set(years.map((y) => Math.floor(y / 10) * 10));
+    document.getElementById("statDecades").textContent = decades.size || "—";
+    if (decades.size) {
+      const sorted = [...decades].sort((a, b) => a - b);
+      const counts = {};
+      years.forEach((y) => {
+        const d = Math.floor(y / 10) * 10;
+        counts[d] = (counts[d] || 0) + 1;
+      });
+      const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+      document.getElementById("statDecadesSub").textContent =
+        "'" + String(top[0]).slice(-2) + "s dominate the shelf (" + top[1] + ")";
+    } else {
+      document.getElementById("statDecadesSub").textContent = "";
+    }
+  }
+
+  /* ---------------- verdict divergence ---------------- */
+  function renderDivergence(movies) {
+    // Recreate the mount unconditionally, not just draw into it: a prior
+    // empty render (see emptyState) removes #divergeChart entirely, and
+    // without this, the next call here would hand `svg` a null reference.
+    document.getElementById("divergeWrap").innerHTML =
+      '<svg class="chart" id="divergeChart" role="img" aria-label="Diverging bar chart of personal rating minus IMDb rating"></svg>';
+    const svg = document.getElementById("divergeChart");
+    const data = movies
+      .map((m) => {
+        const p = normalizedRating(m.ratings, SOURCE.PERSONAL);
+        const i = normalizedRating(m.ratings, SOURCE.IMDB);
+        if (p === null || i === null) return null;
+        return { title: m.title, year: releaseYear(m), delta: p - i, personal: p, imdb: i };
+      })
+      .filter((d) => d !== null)
+      .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+      .slice(0, 8);
+
+    if (!data.length) {
+      emptyState(document.getElementById("divergeWrap"), "No titles with both a Personal and an IMDb rating yet.");
+      return;
+    }
+
+    const rowH = 34, top = 14, labelW = 200, chartW = 640;
+    const x0 = labelW + (chartW - labelW) / 2;
+    const maxAbs = Math.max(...data.map((d) => Math.abs(d.delta)));
+    const domain = Math.max(20, Math.ceil(maxAbs / 10) * 10);
+    const pxPerUnit = (chartW - labelW - 40) / 2 / domain;
+    const height = top + data.length * rowH + 26;
+    svg.setAttribute("viewBox", `0 0 ${chartW} ${height}`);
+    clear(svg);
+
+    svg.appendChild(el("line", {
+      x1: x0, x2: x0, y1: top - 6, y2: top + data.length * rowH,
+      stroke: "var(--baseline)", "stroke-width": 1,
+    }));
+    const tickStep = domain <= 30 ? 10 : Math.ceil(domain / 4 / 10) * 10;
+    for (let u = tickStep; u < domain; u += tickStep) {
+      [u, -u].forEach((v) => {
+        const x = x0 + v * pxPerUnit;
+        const t = el("text", { class: "axis-tick", x, y: top + data.length * rowH + 14, "text-anchor": "middle" });
+        t.textContent = (v > 0 ? "+" : "") + v;
+        svg.appendChild(t);
+      });
+    }
+
+    data.forEach((d, i) => {
+      const y = top + i * rowH, cy = y + rowH / 2;
+      const label = el("text", { class: "row-label", x: labelW - 12, y: cy + 4, "text-anchor": "end" });
+      label.textContent = truncate(d.title, 26);
+      svg.appendChild(label);
+
+      const w = Math.abs(d.delta) * pxPerUnit;
+      const barX = d.delta >= 0 ? x0 : x0 - w;
+      const color = d.delta >= 0 ? "var(--accent)" : "var(--diverge-neg)";
+      const bar = el("rect", { x: barX, y: cy - 7, width: Math.max(w, 2), height: 14, rx: 4, fill: color, class: "hit" });
+      svg.appendChild(bar);
+
+      const valX = d.delta >= 0 ? barX + w + 8 : barX - 8;
+      const val = el("text", { class: "bar-label", x: valX, y: cy + 4, "text-anchor": d.delta >= 0 ? "start" : "end" });
+      val.textContent = fmtDelta(d.delta);
+      svg.appendChild(val);
+
+      wire(bar, `<b>${escapeHtml(d.title)}</b>${d.year ? " (" + d.year + ")" : ""}<br>personal ${d.personal.toFixed(0)} · imdb ${d.imdb.toFixed(0)}<br>Δ ${fmtDelta(d.delta)}`);
+    });
+  }
+
+  /* ---------------- genre / decade bars ---------------- */
+  function renderBarChart(svgId, wrapId, data, opts) {
+    const wrap = document.getElementById(wrapId);
+    // Same recreate-before-draw rule as renderDivergence: a prior empty
+    // render can have removed this svg entirely.
+    wrap.innerHTML = `<svg class="chart" id="${svgId}" role="img" aria-label="${opts.ariaLabel}"></svg>`;
+    const svg = document.getElementById(svgId);
+    if (!data.length) {
+      emptyState(wrap, opts.emptyMsg);
+      return;
+    }
+    const rowH = 24, top = 6, labelW = opts.labelW, chartW = opts.chartW;
+    const max = Math.max(...data.map((d) => d.n));
+    const height = top + data.length * rowH + 6;
+    svg.setAttribute("viewBox", `0 0 ${chartW} ${height}`);
+    data.forEach((d, i) => {
+      const y = top + i * rowH, cy = y + rowH / 2;
+      const label = el("text", { class: "row-label", x: labelW - 10, y: cy + 4, "text-anchor": "end" });
+      label.textContent = d.label;
+      svg.appendChild(label);
+      const w = (d.n / max) * (chartW - labelW - 40);
+      const bar = el("rect", { x: labelW, y: cy - 6, width: Math.max(w, 2), height: 12, rx: 3, fill: "var(--accent)", class: "hit" });
+      svg.appendChild(bar);
+      const val = el("text", { class: "bar-label", x: labelW + w + 8, y: cy + 4 });
+      val.textContent = d.n;
+      svg.appendChild(val);
+      wire(bar, `<b>${escapeHtml(d.label)}</b><br>${d.n} title${d.n === 1 ? "" : "s"}`);
+    });
+  }
+
+  function renderGenre(movies) {
+    const counts = {};
+    movies.forEach((m) => {
+      const g = primaryGenre(m);
+      if (g) counts[g] = (counts[g] || 0) + 1;
+    });
+    let entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    if (entries.length > 8) {
+      const head = entries.slice(0, 7);
+      const otherCount = entries.slice(7).reduce((s, [, n]) => s + n, 0);
+      entries = head.concat([["Other", otherCount]]);
+    }
+    renderBarChart(
+      "genreChart", "genreWrap",
+      entries.map(([label, n]) => ({ label, n })),
+      { labelW: 100, chartW: 560, emptyMsg: "No genre data yet.", ariaLabel: "Horizontal bar chart of title counts by genre" }
+    );
+  }
+
+  function renderDirector(movies) {
+    const counts = {};
+    movies.forEach((m) => {
+      const d = primaryDirector(m);
+      if (d) counts[d] = (counts[d] || 0) + 1;
+    });
+    // A leaderboard, not a full breakdown — unlike genre there's no
+    // meaningful "Other" bucket for a long tail of one-off directors.
+    const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    renderBarChart(
+      "directorChart", "directorWrap",
+      entries.map(([label, n]) => ({ label, n })),
+      { labelW: 130, chartW: 560, emptyMsg: "No director data yet.", ariaLabel: "Horizontal bar chart of title counts by director" }
+    );
+  }
+
+  function renderRated(movies) {
+    const wrap = document.getElementById("ratedWrap");
+    wrap.innerHTML = '<svg class="chart" id="ratedChart" role="img" aria-label="Bar chart of average personal rating by content rating"></svg>';
+    const svg = document.getElementById("ratedChart");
+    const buckets = {};
+    movies.forEach((m) => {
+      const p = normalizedRating(m.ratings, SOURCE.PERSONAL);
+      if (p === null) return;
+      const b = mpaaBucket(m);
+      (buckets[b] = buckets[b] || []).push(p);
+    });
+    const order = [...MPAA_ORDER, "Other"].filter((b) => buckets[b] && buckets[b].length);
+    if (!order.length) {
+      emptyState(wrap, "No rated + personal-score data yet.");
+      return;
+    }
+    const rowH = 26, top = 6, labelW = 60, chartW = 560;
+    const plotW = chartW - labelW - 50;
+    const height = top + order.length * rowH + 6;
+    svg.setAttribute("viewBox", `0 0 ${chartW} ${height}`);
+    document.getElementById("ratedNote").textContent =
+      "Average personal score by MPAA rating (0–100 scale, same axis every row).";
+    order.forEach((bucket, i) => {
+      const vals = buckets[bucket];
+      const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const y = top + i * rowH, cy = y + rowH / 2;
+      const label = el("text", { class: "row-label", x: labelW - 10, y: cy + 4, "text-anchor": "end" });
+      label.textContent = bucket;
+      svg.appendChild(label);
+      const w = (avg / 100) * plotW; // fixed 0-100 domain — buckets stay comparable to each other, not just to their own max
+      const bar = el("rect", { x: labelW, y: cy - 8, width: Math.max(w, 2), height: 16, rx: 3, fill: "var(--accent)", class: "hit" });
+      svg.appendChild(bar);
+      const val = el("text", { class: "bar-label", x: labelW + w + 8, y: cy + 4 });
+      val.textContent = avg.toFixed(0);
+      svg.appendChild(val);
+      wire(bar, `<b>${escapeHtml(bucket)}</b><br>avg ${avg.toFixed(0)}/100 · ${vals.length} title${vals.length === 1 ? "" : "s"}`);
+    });
+  }
+
+  function describeR(r) {
+    const mag = Math.abs(r);
+    const strength = mag < 0.1 ? "no real relationship" : mag < 0.3 ? "a weak" : mag < 0.5 ? "a moderate" : mag < 0.7 ? "a strong" : "a very strong";
+    const sign = r >= 0 ? "positive" : "negative";
+    return mag < 0.1 ? `r = ${r.toFixed(2)} — ${strength}.` : `r = ${r.toFixed(2)} — ${strength} ${sign} relationship.`;
+  }
+
+  function renderRuntimeScatter(movies) {
+    const wrap = document.getElementById("runtimeWrap");
+    wrap.innerHTML = '<svg class="chart" id="runtimeChart" viewBox="0 0 560 260" role="img" aria-label="Scatter plot of personal rating against runtime"></svg>';
+    const svg = document.getElementById("runtimeChart");
+    const points = movies
+      .map((m) => {
+        const runtime = parseRuntime(m);
+        const rating = normalizedRating(m.ratings, SOURCE.PERSONAL);
+        return runtime !== null && rating !== null ? { title: m.title, runtime, rating } : null;
+      })
+      .filter((p) => p !== null);
+    if (points.length < 2) {
+      emptyState(wrap, "Not enough runtime + personal-score data yet.");
+      document.getElementById("runtimeNote").textContent = "Does a longer runtime earn a higher score?";
+      return;
+    }
+    const r = pearsonR(points.map((p) => p.runtime), points.map((p) => p.rating));
+    document.getElementById("runtimeNote").textContent = "Does a longer runtime earn a higher score? " + describeR(r);
+
+    const left = 40, right = 12, top = 10, bottom = 30;
+    const w = 560 - left - right, h = 260 - top - bottom;
+    const runtimes = points.map((p) => p.runtime);
+    const rMin = Math.floor(Math.min(...runtimes) / 10) * 10;
+    const rMax = Math.ceil(Math.max(...runtimes) / 10) * 10;
+    const x = (v) => left + ((v - rMin) / (rMax - rMin)) * w;
+    const y = (v) => top + h - (v / 100) * h;
+
+    [0, 25, 50, 75, 100].forEach((v) => {
+      svg.appendChild(el("line", { x1: left, x2: left + w, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
+      const t = el("text", { class: "axis-tick", x: left - 8, y: y(v) + 3, "text-anchor": "end" });
+      t.textContent = v;
+      svg.appendChild(t);
+    });
+    const step = Math.ceil((rMax - rMin) / 5 / 30) * 30 || 30;
+    for (let v = rMin; v <= rMax; v += step) {
+      const t = el("text", { class: "axis-tick", x: x(v), y: top + h + 18, "text-anchor": "middle" });
+      t.textContent = v + "m";
+      svg.appendChild(t);
+    }
+
+    const fit = linearFit(runtimes, points.map((p) => p.rating));
+    const y1 = Math.max(0, Math.min(100, fit.slope * rMin + fit.intercept));
+    const y2 = Math.max(0, Math.min(100, fit.slope * rMax + fit.intercept));
+    svg.appendChild(el("line", {
+      x1: x(rMin), x2: x(rMax), y1: y(y1), y2: y(y2),
+      stroke: "var(--ink-muted)", "stroke-width": 1.5, "stroke-dasharray": "4,3",
+    }));
+
+    points.forEach((p) => {
+      const c = el("circle", {
+        cx: x(p.runtime), cy: y(p.rating), r: 3.5, fill: "var(--accent)", "fill-opacity": 0.55,
+        stroke: "var(--surface)", "stroke-width": 0.5, class: "hit",
+      });
+      svg.appendChild(c);
+      wire(c, `<b>${escapeHtml(p.title)}</b><br>${p.runtime} min · ${p.rating.toFixed(0)}/100`);
+    });
+  }
+
+  function renderYearRuntimeScatter(movies) {
+    const wrap = document.getElementById("yearRuntimeWrap");
+    wrap.innerHTML = '<svg class="chart" id="yearRuntimeChart" viewBox="0 0 1000 260" role="img" aria-label="Scatter plot of runtime against release year"></svg>';
+    const svg = document.getElementById("yearRuntimeChart");
+    const points = movies
+      .map((m) => {
+        const year = releaseYear(m);
+        const runtime = parseRuntime(m);
+        return year !== null && runtime !== null ? { title: m.title, year, runtime } : null;
+      })
+      .filter((p) => p !== null);
+    if (points.length < 2) {
+      emptyState(wrap, "Not enough release-year + runtime data yet.");
+      document.getElementById("yearRuntimeNote").textContent = "Has runtime crept up over the decades?";
+      return;
+    }
+    const r = pearsonR(points.map((p) => p.year), points.map((p) => p.runtime));
+    document.getElementById("yearRuntimeNote").textContent = "Has runtime crept up over the decades? " + describeR(r);
+
+    const left = 44, right = 16, top = 10, bottom = 30;
+    const w = 1000 - left - right, h = 260 - top - bottom;
+    const years = points.map((p) => p.year);
+    const runtimes = points.map((p) => p.runtime);
+    const xMin = Math.floor(Math.min(...years) / 5) * 5;
+    const xMax = Math.ceil(Math.max(...years) / 5) * 5;
+    // Runtime is a ratio scale (0 means something) — unlike the year axis,
+    // starting it anywhere but 0 would exaggerate how much runtime actually
+    // varies across the collection.
+    const yMax = Math.ceil(Math.max(...runtimes) / 10) * 10;
+    const x = (v) => left + ((v - xMin) / (xMax - xMin)) * w;
+    const y = (v) => top + h - (v / yMax) * h;
+
+    const yStep = Math.ceil(yMax / 5 / 30) * 30 || 30;
+    for (let v = 0; v <= yMax; v += yStep) {
+      svg.appendChild(el("line", { x1: left, x2: left + w, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
+      const t = el("text", { class: "axis-tick", x: left - 8, y: y(v) + 3, "text-anchor": "end" });
+      t.textContent = v + "m";
+      svg.appendChild(t);
+    }
+    const xStep = Math.ceil((xMax - xMin) / 8 / 5) * 5 || 5;
+    for (let v = xMin; v <= xMax; v += xStep) {
+      const t = el("text", { class: "axis-tick", x: x(v), y: top + h + 18, "text-anchor": "middle" });
+      t.textContent = v;
+      svg.appendChild(t);
+    }
+
+    const fit = linearFit(years, runtimes);
+    const y1 = Math.max(0, Math.min(yMax, fit.slope * xMin + fit.intercept));
+    const y2 = Math.max(0, Math.min(yMax, fit.slope * xMax + fit.intercept));
+    svg.appendChild(el("line", {
+      x1: x(xMin), x2: x(xMax), y1: y(y1), y2: y(y2),
+      stroke: "var(--ink-muted)", "stroke-width": 1.5, "stroke-dasharray": "4,3",
+    }));
+
+    points.forEach((p) => {
+      const c = el("circle", {
+        cx: x(p.year), cy: y(p.runtime), r: 3.5, fill: "var(--accent)", "fill-opacity": 0.55,
+        stroke: "var(--surface)", "stroke-width": 0.5, class: "hit",
+      });
+      svg.appendChild(c);
+      wire(c, `<b>${escapeHtml(p.title)}</b><br>${p.year} · ${p.runtime} min`);
+    });
+  }
+
+  function renderBoxOffice(movies) {
+    const wrap = document.getElementById("boxOfficeWrap");
+    wrap.innerHTML = '<svg class="chart" id="boxOfficeChart" viewBox="0 0 560 220" role="img" aria-label="Bar chart of average box office by release decade"></svg>';
+    const svg = document.getElementById("boxOfficeChart");
+    const byDecade = {};
+    movies.forEach((m) => {
+      const bo = parseBoxOffice(m);
+      const y = releaseYear(m);
+      if (bo === null || y === null) return;
+      const d = Math.floor(y / 10) * 10;
+      (byDecade[d] = byDecade[d] || []).push(bo);
+    });
+    const present = Object.keys(byDecade).map(Number).sort((a, b) => a - b);
+    if (!present.length) {
+      emptyState(wrap, "No box-office data yet.");
+      return;
+    }
+    const decades = [];
+    for (let d = present[0]; d <= present[present.length - 1]; d += 10) decades.push(d);
+    const left = 24, right = 12, top = 16, bottom = 46;
+    const w = 560 - left - right, plotH = 130;
+    const avgs = present.map((d) => byDecade[d].reduce((a, b) => a + b, 0) / byDecade[d].length);
+    const max = Math.max(...avgs);
+    const colW = w / decades.length, barW = colW * 0.5;
+    decades.forEach((d, i) => {
+      const vals = byDecade[d];
+      const avg = vals ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+      const cx = left + colW * i + colW / 2;
+      const barH = max ? (avg / max) * plotH : 0;
+      const bar = el("rect", { x: cx - barW / 2, y: top + plotH - barH, width: barW, height: Math.max(barH, vals ? 2 : 0), rx: 3, fill: "var(--accent)", class: "hit" });
+      svg.appendChild(bar);
+      if (vals) {
+        const val = el("text", { class: "bar-label", x: cx, y: top + plotH - barH - 6, "text-anchor": "middle" });
+        val.textContent = fmtMoney(avg);
+        svg.appendChild(val);
+      }
+      wire(bar, vals
+        ? `<b>'${String(d).slice(-2)}s</b><br>avg ${fmtMoney(avg)} · ${vals.length} title${vals.length === 1 ? "" : "s"}`
+        : `<b>'${String(d).slice(-2)}s</b><br>no box-office data`);
+
+      const holeY = top + plotH + 16;
+      svg.appendChild(el("circle", { cx, cy: holeY, r: 4, fill: "none", stroke: "var(--baseline)", "stroke-width": 1.5 }));
+      const lab = el("text", { class: "axis-tick", x: cx, y: holeY + 26, "text-anchor": "middle" });
+      lab.textContent = "'" + String(d).slice(-2) + "s";
+      svg.appendChild(lab);
+    });
+    svg.appendChild(el("line", {
+      x1: left, x2: left + w, y1: top + plotH + 16, y2: top + plotH + 16,
+      stroke: "var(--baseline)", "stroke-width": 1, "stroke-dasharray": "1,5",
+    }));
+  }
+
+  function renderDecade(movies) {
+    const counts = {};
+    movies.forEach((m) => {
+      const y = releaseYear(m);
+      if (y === null) return;
+      const d = Math.floor(y / 10) * 10;
+      counts[d] = (counts[d] || 0) + 1;
+    });
+    const presentDecades = Object.keys(counts).map(Number).sort((a, b) => a - b);
+    const wrap = document.getElementById("decadeWrap");
+    wrap.innerHTML = '<svg class="chart" id="decadeChart" viewBox="0 0 560 220" role="img" aria-label="Bar chart of title counts by release decade"></svg>';
+    const svg = document.getElementById("decadeChart");
+    if (!presentDecades.length) {
+      emptyState(wrap, "No release-year data yet.");
+      return;
+    }
+    // Equal-width bars on a time axis imply equal time steps — a collection
+    // with an 1980s title and nothing again until the 2010s would otherwise
+    // render three adjacent bars as if those decades were consecutive.
+    const decades = [];
+    for (let d = presentDecades[0]; d <= presentDecades[presentDecades.length - 1]; d += 10) decades.push(d);
+    const left = 24, right = 12, top = 10, bottom = 46;
+    const w = 560 - left - right, plotH = 130;
+    const max = Math.max(...presentDecades.map((d) => counts[d]));
+    const colW = w / decades.length, barW = colW * 0.5;
+    decades.forEach((d, i) => {
+      const n = counts[d] || 0;
+      const cx = left + colW * i + colW / 2;
+      const barH = (n / max) * plotH;
+      const bar = el("rect", { x: cx - barW / 2, y: top + plotH - barH, width: barW, height: Math.max(barH, n ? 2 : 0), rx: 3, fill: "var(--accent)", class: "hit" });
+      svg.appendChild(bar);
+      if (n) {
+        const val = el("text", { class: "bar-label", x: cx, y: top + plotH - barH - 6, "text-anchor": "middle" });
+        val.textContent = n;
+        svg.appendChild(val);
+      }
+      wire(bar, `<b>'${String(d).slice(-2)}s</b><br>${n} title${n === 1 ? "" : "s"}`);
+
+      const holeY = top + plotH + 16;
+      svg.appendChild(el("circle", { cx, cy: holeY, r: 4, fill: "none", stroke: "var(--baseline)", "stroke-width": 1.5 }));
+      const lab = el("text", { class: "axis-tick", x: cx, y: holeY + 26, "text-anchor": "middle" });
+      lab.textContent = "'" + String(d).slice(-2) + "s";
+      svg.appendChild(lab);
+    });
+    svg.appendChild(el("line", {
+      x1: left, x2: left + w, y1: top + plotH + 16, y2: top + plotH + 16,
+      stroke: "var(--baseline)", "stroke-width": 1, "stroke-dasharray": "1,5",
+    }));
+  }
+
+  /* ---------------- recently catalogued ---------------- */
+  const LEDGER_TABLE_HTML =
+    '<table class="ledger"><thead><tr>' +
+    "<th>Title</th><th class=\"num\">Personal</th><th class=\"num\">IMDb</th><th class=\"num\">Δ</th><th>Refreshed</th>" +
+    '</tr></thead><tbody id="ledgerBody"></tbody></table>';
+
+  function renderLedger(recentMovies) {
+    const wrap = document.getElementById("ledgerWrap");
+    // Same recreate-before-draw rule as the chart panels: a prior empty
+    // render removes the whole table (ledgerBody included), so rebuild it
+    // fresh rather than assume it's still there.
+    wrap.innerHTML = LEDGER_TABLE_HTML;
+    const body = document.getElementById("ledgerBody");
+    if (!recentMovies.length) {
+      emptyState(wrap, "Nothing refreshed yet — run the refresh job to populate this.");
+      return;
+    }
+    recentMovies.forEach((m) => {
+      const p = normalizedRating(m.ratings, SOURCE.PERSONAL);
+      const i = normalizedRating(m.ratings, SOURCE.IMDB);
+      const delta = p !== null && i !== null ? p - i : null;
+      const tr = document.createElement("tr");
+      const g = primaryGenre(m) || "—";
+      const y = releaseYear(m) || "—";
+      tr.innerHTML = `
+        <td class="title-cell"><span class="t">${escapeHtml(m.title)}</span><span class="g">${escapeHtml(g)} · ${y}</span></td>
+        <td class="num">${p !== null ? p.toFixed(0) : "—"}</td>
+        <td class="num">${i !== null ? i.toFixed(0) : "—"}</td>
+        <td class="num ${delta === null ? "" : delta >= 0 ? "delta-up" : "delta-down"}">${delta === null ? "—" : (delta >= 0 ? "▲ " : "▼ ") + Math.abs(delta).toFixed(0)}</td>
+        <td>${fmtDate(m.last_refreshed)}${isStale(m.last_refreshed) ? ' <span class="chip stale">stale</span>' : ""}</td>
+      `;
+      body.appendChild(tr);
+    });
+  }
+
+  /* ---------------- title inspector ---------------- */
+  // OMDb fills anything it doesn't hold with the literal string "N/A" —
+  // rendering that as a fact row is worse than dropping the row.
+  function presentField(v) {
+    if (v == null) return null;
+    const s = String(v).trim();
+    return s === "" || s === "N/A" ? null : s;
+  }
+
+  // The stored doc keeps each source's raw string ("6.5/10", "60%", "79"),
+  // which is the honest value to show — the bar underneath is what makes
+  // four different scales comparable, so both are drawn.
+  function meterHtml(movie, source) {
+    const raw = ratingBySource(movie.ratings, source);
+    const norm = normalizedRating(movie.ratings, source);
+    if (raw === null || norm === null) return "";
+    const pct = Math.max(0, Math.min(100, norm));
+    return `<div class="meter">
+        <div class="m-head"><span>${escapeHtml(SOURCE_LABEL[source])}</span><span class="m-raw">${escapeHtml(raw)}</span></div>
+        <div class="m-track"><div class="m-fill" style="width:${pct.toFixed(1)}%;background:var(${SOURCE_COLOR_VAR[source]})"></div></div>
+      </div>`;
+  }
+
+  function renderMovieDetail(movie) {
+    const wrap = document.getElementById("detailWrap");
+    if (!movie) {
+      emptyState(wrap, "Catalogue a title to inspect it.");
+      return;
+    }
+
+    const year = releaseYear(movie);
+    const subLine = [presentField(movie.rated), presentField(movie.runtime), presentField(movie.genre)]
+      .filter(Boolean)
+      .join("  ·  ");
+    const plot = presentField(movie.plot);
+    const meters = SOURCE_ORDER.map((s) => meterHtml(movie, s)).join("");
+
+    const facts = [];
+    const addFact = (label, value) => {
+      const v = presentField(value);
+      if (v) facts.push([label, escapeHtml(v)]);
+    };
+    addFact("Released", movie.released);
+    addFact("Director", movie.director);
+    addFact("Writer", movie.writer);
+    addFact("Cast", movie.actors);
+    addFact("Language", movie.language);
+    addFact("Country", movie.country);
+    addFact("Awards", movie.awards);
+    addFact("Box office", movie.box_office);
+    addFact("IMDb votes", movie.imdb_votes);
+
+    const personal = normalizedRating(movie.ratings, SOURCE.PERSONAL);
+    const imdb = normalizedRating(movie.ratings, SOURCE.IMDB);
+    if (personal !== null && imdb !== null) {
+      const d = personal - imdb;
+      facts.push(["Δ vs IMDb", `<span class="${d >= 0 ? "delta-up" : "delta-down"}">${fmtDelta(d)}</span>`]);
+    }
+
+    // Only the refresh job stamps `_refreshed`; POST doesn't. A title
+    // catalogued and never refreshed since therefore has no date to show —
+    // name the missing field rather than say "never refreshed", which would
+    // contradict the ledger's Refreshed column (that one is derived from
+    // ratings_history, which POST does write).
+    const refreshed = presentField(movie._refreshed);
+    facts.push(["Last refresh", refreshed
+      ? escapeHtml(fmtDate(refreshed)) + (isStale(refreshed) ? ' <span class="chip stale">stale</span>' : "")
+      : '<span class="chip">no _refreshed stamp</span>']);
+
+    const imdbId = presentField(movie.imdb_id);
+    if (imdbId) {
+      facts.push(["imdb_id", /^tt\d+$/.test(imdbId)
+        ? `<a href="https://www.imdb.com/title/${imdbId}/" target="_blank" rel="noopener noreferrer">${imdbId}</a>`
+        : escapeHtml(imdbId)]);
+    }
+
+    // The poster is the one thing on this page fetched from outside the
+    // house (OMDb hands back an Amazon CDN URL). no-referrer keeps the
+    // request from carrying this dashboard's own address; the scheme test
+    // keeps a hand-edited row from putting anything but http(s) in src.
+    const poster = presentField(movie.poster);
+    const posterHtml = poster && /^https?:\/\//i.test(poster)
+      ? `<img class="detail-poster" src="${escapeHtml(poster)}" alt="Poster for ${escapeHtml(movie.title)}" referrerpolicy="no-referrer" loading="lazy">`
+      : '<div class="detail-poster-missing">no poster</div>';
+
+    wrap.innerHTML = `
+      <div class="detail">
+        <div>${posterHtml}</div>
+        <div class="detail-body">
+          <h3>${escapeHtml(movie.title)}${year ? " (" + year + ")" : ""}</h3>
+          ${subLine ? `<div class="sub-line">${escapeHtml(subLine)}</div>` : ""}
+          ${plot ? `<p class="plot">${escapeHtml(plot)}</p>` : ""}
+          ${meters ? `<div class="meters">${meters}</div>` : ""}
+          <dl class="facts">${facts.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${v}</dd>`).join("")}</dl>
+        </div>
+      </div>`;
+
+    // A dead poster URL (OMDb rotates them) would otherwise leave a broken
+    // image icon where the artwork should be.
+    const img = wrap.querySelector("img.detail-poster");
+    if (img) {
+      img.addEventListener("error", () => {
+        const ph = document.createElement("div");
+        ph.className = "detail-poster-missing";
+        ph.textContent = "no poster";
+        img.replaceWith(ph);
+      });
+    }
+  }
+
+  // Survives the full re-render that adding a title triggers, so picking a
+  // title and then cataloguing another doesn't throw away your place.
+  let detailSelected = null;
+  function renderInspector(movies, defaultImdbId) {
+    const select = document.getElementById("detailSelect");
+    clear(select);
+    if (!movies.length) {
+      select.disabled = true;
+      renderMovieDetail(null);
+      return;
+    }
+    select.disabled = false;
+    const sorted = [...movies].sort((a, b) => a.title.localeCompare(b.title));
+    sorted.forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m.imdb_id;
+      opt.textContent = m.title + (releaseYear(m) ? " (" + releaseYear(m) + ")" : "");
+      select.appendChild(opt);
+    });
+    const kept = detailSelected && movies.some((m) => m.imdb_id === detailSelected) ? detailSelected : null;
+    const fallback = defaultImdbId && movies.some((m) => m.imdb_id === defaultImdbId) ? defaultImdbId : sorted[0].imdb_id;
+    const chosen = kept || fallback;
+    select.value = chosen;
+    detailSelected = chosen;
+    select.onchange = () => {
+      detailSelected = select.value;
+      renderMovieDetail(movies.find((m) => m.imdb_id === select.value) || null);
+    };
+    renderMovieDetail(movies.find((m) => m.imdb_id === chosen) || null);
+  }
+
+  /* ---------------- rating drift ---------------- */
+  function renderDriftLegend(sourcesPresent) {
+    const legend = document.getElementById("driftLegend");
+    clear(legend);
+    sourcesPresent.forEach((s) => {
+      const item = document.createElement("span");
+      item.className = "legend-item";
+      item.innerHTML = `<span class="legend-line" style="background:var(${SOURCE_COLOR_VAR[s]})"></span>${SOURCE_LABEL[s]}`;
+      legend.appendChild(item);
+    });
+  }
+
+  function renderDriftChart(snapshots, title) {
+    document.getElementById("driftNote").textContent =
+      title ? `${title} — every score logged since first catalogued, indexed to /100.` : "Every score logged since first catalogued, indexed to /100.";
+    if (!snapshots.length) {
+      emptyState(document.getElementById("driftWrap"), "No refresh snapshots yet for this title.");
+      renderDriftLegend([]);
+      return;
+    }
+    const bySource = {};
+    snapshots.forEach((s) => {
+      if (!SOURCE_LABEL[s.source]) return; // ignore unknown/future source names
+      const t = new Date(s.observed).getTime();
+      const v = s.source === SOURCE.IMDB ? parseNumber(s.value) * 10 : parseNumber(s.value);
+      if (!Number.isFinite(t) || v === null) return;
+      (bySource[s.source] = bySource[s.source] || []).push({ t, v });
+    });
+    const present = SOURCE_ORDER.filter((s) => bySource[s] && bySource[s].length);
+    renderDriftLegend(present);
+    if (!present.length) {
+      emptyState(document.getElementById("driftWrap"), "No recognizable rating sources in this title's history.");
+      return;
+    }
+    document.getElementById("driftWrap").innerHTML = '<svg class="chart" id="driftChart" viewBox="0 0 420 306" role="img"></svg>';
+    const freshSvg = document.getElementById("driftChart");
+
+    const allTimes = present.flatMap((s) => bySource[s].map((p) => p.t));
+    const tMin = Math.min(...allTimes), tMax = Math.max(...allTimes);
+    // right leaves a gutter for the endpoint labels drawn past x(tMax) below
+    // — SOURCE_SHORT_LABEL's longest value ("IMDb") plus its 8px offset.
+    const left = 34, right = 40, top = 10, bottom = 28;
+    const w = 420 - left - right, h = 306 - top - bottom;
+    const x = (t) => (tMax === tMin ? left + w / 2 : left + ((t - tMin) / (tMax - tMin)) * w);
+    const y = (v) => top + h - (v / 100) * h;
+
+    [0, 25, 50, 75, 100].forEach((v) => {
+      freshSvg.appendChild(el("line", { x1: left, x2: left + w, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
+      const t = el("text", { class: "axis-tick", x: left - 8, y: y(v) + 3, "text-anchor": "end" });
+      t.textContent = v;
+      freshSvg.appendChild(t);
+    });
+    const span = tMax - tMin;
+    const dateTicks = tMax === tMin ? [tMin] : [tMin, tMin + span / 2, tMax];
+    const seenLabels = new Set();
+    dateTicks.forEach((t) => {
+      const text = formatAxisDate(t, span);
+      if (seenLabels.has(text)) return; // e.g. a 3-day span at month granularity
+      seenLabels.add(text);
+      const lab = el("text", { class: "axis-tick", x: x(t), y: top + h + 18, "text-anchor": "middle" });
+      lab.textContent = text;
+      freshSvg.appendChild(lab);
+    });
+
+    // Endpoint labels: collect target positions first and only place the
+    // text after drawing every line/point, so a collision-avoidance pass can
+    // spread out labels whose values land close together (e.g. a title with
+    // one snapshot puts every source's label at nearly the same y) — drawn
+    // as-is they overlap into unreadable stacked text.
+    const labelTargets = [];
+    present.forEach((s) => {
+      const pts = bySource[s].sort((a, b) => a.t - b.t);
+      const color = "var(" + SOURCE_COLOR_VAR[s] + ")";
+      const width = s === SOURCE.PERSONAL ? 3 : 2;
+      if (pts.length > 1) {
+        const d = pts.map((p, i) => (i === 0 ? "M" : "L") + x(p.t) + " " + y(p.v)).join(" ");
+        freshSvg.appendChild(el("path", { d, fill: "none", stroke: color, "stroke-width": width, "stroke-linecap": "round", "stroke-linejoin": "round" }));
+      }
+      pts.forEach((p) => {
+        const c = el("circle", { cx: x(p.t), cy: y(p.v), r: 4, fill: color, stroke: "var(--surface)", "stroke-width": 1.5, class: "hit" });
+        freshSvg.appendChild(c);
+        wire(c, `<b>${SOURCE_LABEL[s]}</b><br>${new Date(p.t).toISOString().slice(0, 10)} · ${p.v.toFixed(0)}/100`);
+      });
+      const last = pts[pts.length - 1];
+      labelTargets.push({ source: s, color, x: x(last.t) + 8, y: y(last.v) });
+    });
+    const MIN_LABEL_GAP = 13;
+    labelTargets.sort((a, b) => a.y - b.y);
+    for (let i = 1; i < labelTargets.length; i++) {
+      if (labelTargets[i].y - labelTargets[i - 1].y < MIN_LABEL_GAP) {
+        labelTargets[i].y = labelTargets[i - 1].y + MIN_LABEL_GAP;
+      }
+    }
+    // The ladder above only pushes down, so 3+ clustered labels can run past
+    // the plot into the date-axis ticks below it — pull the whole stack back
+    // up rather than let the last one collide.
+    const overflow = labelTargets.length ? labelTargets[labelTargets.length - 1].y - (top + h) : 0;
+    if (overflow > 0) labelTargets.forEach((lt) => { lt.y -= overflow; });
+    labelTargets.forEach((lt) => {
+      const lab = el("text", { class: "bar-label", x: lt.x, y: lt.y + 4 });
+      lab.setAttribute("style", "fill:" + lt.color);
+      lab.textContent = SOURCE_SHORT_LABEL[lt.source];
+      freshSvg.appendChild(lab);
+    });
+  }
+
+  // Guards against picking a new title before the previous one's history
+  // fetch has resolved — without this, a fast switch away and back can have
+  // the slower, stale response land last and overwrite the correct chart.
+  let driftRequestId = 0;
+  async function loadDrift(imdbId, title) {
+    const requestId = ++driftRequestId;
+    try {
+      const data = await apiFetch("/movies/" + encodeURIComponent(imdbId) + "/history");
+      if (requestId !== driftRequestId) return;
+      renderDriftChart(data.snapshots || [], title);
+    } catch (e) {
+      if (requestId !== driftRequestId) return;
+      if (e.message !== "unauthorized") emptyState(document.getElementById("driftWrap"), "Couldn't load history for this title.");
+    }
+  }
+
+  function renderDriftSelector(movies, defaultImdbId) {
+    const select = document.getElementById("driftSelect");
+    clear(select);
+    if (!movies.length) {
+      select.disabled = true;
+      emptyState(document.getElementById("driftWrap"), "Catalogue a title to see rating drift.");
+      renderDriftLegend([]);
+      return;
+    }
+    select.disabled = false;
+    const sorted = [...movies].sort((a, b) => a.title.localeCompare(b.title));
+    sorted.forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m.imdb_id;
+      opt.textContent = m.title + (releaseYear(m) ? " (" + releaseYear(m) + ")" : "");
+      select.appendChild(opt);
+    });
+    const chosen = defaultImdbId && movies.some((m) => m.imdb_id === defaultImdbId) ? defaultImdbId : sorted[0].imdb_id;
+    select.value = chosen;
+    select.onchange = () => {
+      const m = movies.find((mm) => mm.imdb_id === select.value);
+      loadDrift(select.value, m ? m.title : "");
+    };
+    const chosenMovie = movies.find((m) => m.imdb_id === chosen);
+    loadDrift(chosen, chosenMovie ? chosenMovie.title : "");
+  }
+
+  /* ---------------- boot ---------------- */
+  async function boot() {
+    statusLine.textContent = "connecting…";
+    try {
+      const [movies, recentMovies] = await Promise.all([
+        apiFetch("/movies"),
+        apiFetch("/movies/recent?limit=8"),
+      ]);
+      statusLine.textContent = "live · " + movies.length + " titles";
+      renderStats(movies);
+      renderDivergence(movies);
+      renderGenre(movies);
+      renderDecade(movies);
+      renderDirector(movies);
+      renderRated(movies);
+      renderRuntimeScatter(movies);
+      renderBoxOffice(movies);
+      renderYearRuntimeScatter(movies);
+      renderLedger(recentMovies);
+      renderInspector(movies, recentMovies[0] ? recentMovies[0].imdb_id : null);
+      renderDriftSelector(movies, recentMovies[0] ? recentMovies[0].imdb_id : null);
+      document.getElementById("footRefreshNote").textContent =
+        recentMovies[0] ? "last refresh " + fmtDate(recentMovies[0].last_refreshed) : "";
+    } catch (e) {
+      if (e.message !== "unauthorized") {
+        statusLine.textContent = "connection failed";
+        console.error(e);
+      }
+    }
+  }
+
+  if (getKey()) boot(); else showKeyPrompt("");
+})();
+</script>
+</body>
+</html>
