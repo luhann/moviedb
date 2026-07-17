@@ -73,10 +73,6 @@ to pull updated ratings.
 ```bash
 mkdir -p /opt/moviedb
 
-# copy the binary in, plus migrate_dynamo.py AND migrate_snake_case.py if
-# migrating from DynamoDB (the former imports the latter's key mapping)
-# (pct push from the host, or scp)
-
 cp dist/moviedb.env.example /etc/moviedb.env
 chmod 600 /etc/moviedb.env
 # edit /etc/moviedb.env: set API_KEY (openssl rand -hex 32) and OMDB_KEY
@@ -116,33 +112,6 @@ Proxmox host, restart, verify); set `PVE_HOST`/`VMID` if the defaults
 # so an upgrade push without it strips the exec bit -> systemd 203/EXEC
 pct push 210 target/x86_64-unknown-linux-musl/release/moviedb /opt/moviedb/moviedb --perms 0755
 ```
-
-## Migrate the DynamoDB data
-
-This step is also optional, it is included because previously this REST API pushed data to AWS DynamoDB, if you are starting
-from scratch this is not necessary.
-
-On any machine with AWS credentials:
-
-```bash
-aws dynamodb scan --table-name movies --output json > movies.json
-```
-
-If the output contains `LastEvaluatedKey`, the scan paginated — at 1MB per
-page you're fine unless you've rated thousands of movies, but the migration
-script warns if the export is incomplete.
-
-Copy `movies.json` into the LXC, then:
-
-```bash
-systemctl stop moviedb
-python3 /opt/moviedb/migrate_dynamo.py movies.json /var/lib/moviedb/movies.db
-systemctl start moviedb
-```
-
-(The migration script is stdlib-only Python.)
-
-The script prints export count vs. table row count, make sure that they match.
 
 ## Routing
 
