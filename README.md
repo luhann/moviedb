@@ -7,14 +7,30 @@ The binary has `moviedb serve` and `moviedb refresh`. `serve` starts the REST AP
 from [OMDB](https://www.omdbapi.com/) and stores the previous ratings in the `ratings_history` table so that I can
 record data on longitudinal ratings changes across all movies I have watched.
 
-Endpoints:
+Endpoints (every response, success or error, is JSON; movie-doc keys are
+snake_case — `imdb_id`, `imdb_rating`, `box_office`, ratings entries
+`{"source": ..., "value": ...}`):
 
 ```
-POST /         ?title=<title>&rating=<77>&year=<2026>        fetch OMDB, upsert, snapshot ratings
-GET  /                                      all movies
-GET  /single   ?imdbid=  OR  ?title=&year=  one movie
-GET  /history  ?imdbid=  OR  ?title=&year=  ratings snapshots, oldest first
+POST /movies   ?title=<title>&rating=<77>&year=<2026>   fetch OMDB, upsert, snapshot ratings
+                 -> 201 + Location: /movies/{imdb_id} (new) or 200 (existing), body is the stored doc
+GET  /movies   [?title=<title>] [?year=<year>]          the collection, optionally filtered
+GET  /movies/{imdb_id}                                  one movie
+GET  /movies/{imdb_id}/history                          ratings snapshots, oldest first
 ```
+
+A movie's canonical URI is `/movies/{imdb_id}`; title/year lookup is a
+filter on the collection (exact, case-sensitive, indexed). A filter matching
+several movies returns them all and one matching none returns `[]` — with a
+non-unique key, multiple/zero matches are data, not errors. Only
+`/movies/{imdb_id}` can 404.
+
+Errors are `{"detail": "..."}` with a standard HTTP status: 400 (malformed
+path parameter), 401 (bad/missing `x-api-key`), 404 (unknown `imdb_id`),
+422 (query params missing/empty/unparseable), 502/503 (OMDB returned
+something unrecognized / its daily quota is exhausted or the server is
+briefly out of DB capacity — both 503s carry `Retry-After`), 500 (internal
+error).
 
 ## Build
 
@@ -57,7 +73,9 @@ to pull updated ratings.
 ```bash
 mkdir -p /opt/moviedb
 
-# copy the binary + migrate_dynamo.py in (pct push from the host, or scp)
+# copy the binary in, plus migrate_dynamo.py AND migrate_snake_case.py if
+# migrating from DynamoDB (the former imports the latter's key mapping)
+# (pct push from the host, or scp)
 
 cp dist/moviedb.env.example /etc/moviedb.env
 chmod 600 /etc/moviedb.env
@@ -69,6 +87,24 @@ systemctl enable --now moviedb moviedb-refresh.timer
 systemctl status moviedb
 systemd-analyze security moviedb   # exposure score; expect ~1.x
 ```
+
+### Upgrading a v1.x database to v2.0.0
+
+v2.0.0 renamed the stored movie-doc keys to snake_case (`imdbrating` ->
+`imdb_rating`, ratings entries `Source`/`Value` -> `source`/`value`). A DB
+written by v1.x must be migrated once, with the service stopped, before the
+v2 binary serves it — refresh and the ratings-history snapshots read the new
+key spellings:
+
+```bash
+systemctl stop moviedb
+sqlite3 /var/lib/moviedb/movies.db ".backup /root/pre-v2-movies.db"
+python3 migrate_snake_case.py /var/lib/moviedb/movies.db   # scripts/migrate_snake_case.py, stdlib-only
+# push the v2 binary (see below), then:
+systemctl start moviedb
+```
+
+The script is idempotent — rerunning it on migrated data changes nothing.
 
 Upgrades are the same push + `systemctl restart moviedb`. `scripts/deploy.sh`
 does the whole upgrade from the workstation (build, smoke test, push via the
@@ -117,14 +153,16 @@ Up to you. I use [traefik](https://github.com/traefik/traefik) as my reverse pro
 
 - **Key changed deliberately**: `imdb_id` primary key instead of DynamoDB's
   (title, year). Re-POSTing after OMDB corrects a title no longer creates a
-  duplicate row. `/single` still accepts `title` + `year` (exact,
-  case-sensitive, indexed) so existing curls work; `imdbid` also accepted.
-- **POST returns the bare title as plain text**, matching the Lambda body.
+  duplicate row. Title/year lookup survives as a `GET /movies` collection
+  filter (exact, case-sensitive, indexed).
+- **POST returns the stored movie doc as JSON** (201 + `Location` if the
+  imdb_id is new, 200 if it already existed), not the Lambda's bare-title
+  plain-text body.
 - **`year` is required on POST**; the Lambda threw a KeyError (502) if
-  omitted, this returns a clean 400 (axum's query rejection; the FastAPI
-  version returned 422 — accepted drift, nothing checks these codes).
-- **No trailing slashes**: `/single/` is an unmatched route (empty 404), not
-  a redirect to `/single`. FastAPI 307-redirected these, which `curl -L`
+  omitted, this returns a clean 422 JSON `{"detail": ...}` (axum's query
+  rejection, normalized to this API's error shape).
+- **No trailing slashes**: `/movies/` is an unmatched route (empty 404), not
+  a redirect to `/movies`. FastAPI 307-redirected these, which `curl -L`
   followed silently; axum matches exactly. Slashless resource paths are the
   API convention — fix the URL, not the router.
 - **Ratings history**: every POST and refresh appends one row per rating
