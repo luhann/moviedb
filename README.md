@@ -15,6 +15,9 @@ snake_case — `imdb_id`, `imdb_rating`, `box_office`, ratings entries
 POST /movies   ?title=<title>&rating=<77>&year=<2026>   fetch OMDB, upsert, snapshot ratings
                  -> 201 + Location: /movies/{imdb_id} (new) or 200 (existing), body is the stored doc
 GET  /movies   [?title=<title>] [?year=<year>]          the collection, optionally filtered
+GET  /movies/recent  [?limit=<n>]                       most-recently-refreshed movies, newest
+                                                          first (default 10, max 50), with
+                                                          last_refreshed folded into each doc
 GET  /movies/{imdb_id}                                  one movie
 GET  /movies/{imdb_id}/history                          ratings snapshots, oldest first
 ```
@@ -23,7 +26,9 @@ A movie's canonical URI is `/movies/{imdb_id}`; title/year lookup is a
 filter on the collection (exact, case-sensitive, indexed). A filter matching
 several movies returns them all and one matching none returns `[]` — with a
 non-unique key, multiple/zero matches are data, not errors. Only
-`/movies/{imdb_id}` can 404.
+`/movies/{imdb_id}` can 404. Collection responses (`/movies`,
+`/movies/recent`) are bare JSON arrays; a response is an object only when it
+carries fields beyond the collection itself (`/history`'s `imdb_id`).
 
 Errors are `{"detail": "..."}` with a standard HTTP status: 400 (malformed
 path parameter), 401 (bad/missing `x-api-key`), 404 (unknown `imdb_id`),

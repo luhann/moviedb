@@ -2,7 +2,8 @@
 
 Runs the real binary against a stub OMDB server and a temp DB: the full
 endpoint matrix (auth, POST /movies, GET /movies with and without filters,
-GET /movies/{imdb_id}, GET /movies/{imdb_id}/history, error paths) plus
+GET /movies/recent, GET /movies/{imdb_id}, GET /movies/{imdb_id}/history,
+error paths) plus
 refresh edge cases (null Personal rating, OMDB response missing Title).
 
 Usage:
@@ -199,6 +200,17 @@ def main():
             results.append((
                 "update POST appended a second snapshot pair",
                 s == 200 and len(h["snapshots"]) == 4))
+
+            # /movies/recent is a bare array like GET /movies (the
+            # envelope-free collection convention), with last_refreshed
+            # folded into each doc, not carried on a wrapper object.
+            s, b = req("GET", "/movies/recent?limit=5")
+            recent = json.loads(b)
+            results.append((
+                "GET /movies/recent bare array + last_refreshed",
+                s == 200 and isinstance(recent, list) and len(recent) == 1
+                and recent[0]["imdb_id"] == "tt0133093"
+                and recent[0]["last_refreshed"].endswith("+00:00")))
         finally:
             proc.terminate()
             proc.wait()
