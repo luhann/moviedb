@@ -1,15 +1,16 @@
-"""End-to-end smoke test for the moviedb binary. Stdlib only.
+"""End-to-end test for the moviedb binary. Stdlib only.
 
 Runs the real binary against a stub OMDB server and a temp DB: the full
 endpoint matrix (auth, POST /movies, GET /movies with and without filters,
 GET /movies/recent, GET /movies/{imdb_id}, GET /movies/{imdb_id}/history,
-error paths) plus
-refresh edge cases (null Personal rating, OMDB response missing Title).
+error paths incl. the problem+json contract on unmatched paths/methods)
+plus refresh edge cases (null Personal rating, OMDB response missing Title).
 
 Usage:
     python3 tests/smoke_test.py [path-to-binary]
     # default: target/x86_64-unknown-linux-musl/release/moviedb
 """
+
 import json
 import os
 import sqlite3
@@ -24,15 +25,22 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    REPO, "target/x86_64-unknown-linux-musl/release/moviedb")
+BIN = (
+    sys.argv[1]
+    if len(sys.argv) > 1
+    else os.path.join(REPO, "target/x86_64-unknown-linux-musl/release/moviedb")
+)
 API = "http://127.0.0.1:8123"
 KEY = "smoke-test-key"
 
 OMDB_DOC = {
-    "Title": "The Matrix", "Year": "1999", "Rated": "R",
+    "Title": "The Matrix",
+    "Year": "1999",
+    "Rated": "R",
     "Ratings": [{"Source": "Internet Movie Database", "Value": "8.7/10"}],
-    "imdbID": "tt0133093", "Type": "movie", "Response": "True",
+    "imdbID": "tt0133093",
+    "Type": "movie",
+    "Response": "True",
 }
 
 
@@ -43,7 +51,10 @@ class Stub(BaseHTTPRequestHandler):
         if title == "TriggerDailyLimit":
             doc = {"Response": "False", "Error": "Daily request limit reached!"}
         elif title == "TriggerUnknownError":
-            doc = {"Response": "False", "Error": "Some new OMDB error this stub doesn't know"}
+            doc = {
+                "Response": "False",
+                "Error": "Some new OMDB error this stub doesn't know",
+            }
         else:
             doc = dict(OMDB_DOC)
             # refresh-by-id path: tt0000002 gets Response=True with no Title
@@ -78,92 +89,147 @@ def req(method, path, key=KEY):
 
 
 def main():
+    if not os.path.exists(BIN):
+        sys.exit(f"binary not found: {BIN} — build it or pass a path")
     results = []
     with tempfile.TemporaryDirectory() as tmp:
         db_path = os.path.join(tmp, "smoke.db")
         srv = HTTPServer(("127.0.0.1", 8098), Stub)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        env = dict(os.environ, API_KEY=KEY, OMDB_KEY="stub", DB_PATH=db_path,
-                   OMDB_URL="http://127.0.0.1:8098/")
+        env = dict(
+            os.environ,
+            API_KEY=KEY,
+            OMDB_KEY="stub",
+            DB_PATH=db_path,
+            OMDB_URL="http://127.0.0.1:8098/",
+        )
 
         proc = subprocess.Popen(
-            [BIN, "serve", "--host", "127.0.0.1", "--port", "8123"], env=env)
+            [BIN, "serve", "--host", "127.0.0.1", "--port", "8123"], env=env
+        )
         try:
+            # Fail loudly if the server dies or never comes up — falling
+            # through silently would surface as an unrelated traceback on
+            # the first real request, with no results printed.
             for _ in range(50):
+                if proc.poll() is not None:
+                    sys.exit(f"server exited during startup (code {proc.poll()})")
                 try:
                     req("GET", "/movies")
                     break
-                except Exception:
+                except OSError:  # URLError incl. connection refused
                     time.sleep(0.1)
+            else:
+                sys.exit("server did not answer within 5s")
 
             # Full RFC 9457 shape checked once here; the rest of the error
             # tests only assert the members they care about.
             s, b, headers = req_full("GET", "/movies", key=None)
             prob = json.loads(b)
-            results.append((
-                "401 problem+json shape without key",
-                s == 401
-                and headers.get("content-type") == "application/problem+json"
-                and prob["type"] == "about:blank"
-                and prob["title"] == "Unauthorized"
-                and prob["status"] == 401
-                and "Invalid API key" in prob["detail"]))
+            results.append(
+                (
+                    "401 problem+json shape without key",
+                    s == 401
+                    and headers.get("content-type") == "application/problem+json"
+                    and prob["type"] == "about:blank"
+                    and prob["title"] == "Unauthorized"
+                    and prob["status"] == 401
+                    and "Invalid API key" in prob["detail"],
+                )
+            )
 
             # Unmatched paths and unsupported methods must keep the JSON
             # error contract — axum's bare defaults are empty-bodied.
             s, b = req("GET", "/nonexistent")
             results.append(("404 JSON on unmatched path", s == 404 and "detail" in b))
             s, b, headers = req_full("DELETE", "/movies")
-            results.append((
-                "405 JSON + Allow on unsupported method",
-                s == 405 and "detail" in b and "GET" in headers.get("allow", "")))
+            results.append(
+                (
+                    "405 JSON + Allow on unsupported method",
+                    s == 405 and "detail" in b and "GET" in headers.get("allow", ""),
+                )
+            )
             s, b = req("GET", "/nonexistent", key=None)
-            results.append(("401 precedes 404 on unmatched path", s == 401 and "detail" in b))
+            results.append(
+                ("401 precedes 404 on unmatched path", s == 401 and "detail" in b)
+            )
 
-            s, b, headers = req_full("POST", "/movies?title=The+Matrix&rating=9/10&year=1999")
+            s, b, headers = req_full(
+                "POST", "/movies?title=The+Matrix&rating=9/10&year=1999"
+            )
             doc = json.loads(b) if s == 201 else {}
-            results.append((
-                "POST creates movie -> 201 JSON + Location",
-                s == 201 and doc.get("title") == "The Matrix"
-                and doc.get("imdb_id") == "tt0133093"  # imdbID -> snake_case
-                and doc["ratings"][-1] == {"source": "Personal", "value": "9/10"}
-                and "response" not in doc
-                and headers.get("location") == "/movies/tt0133093"))
+            results.append(
+                (
+                    "POST creates movie -> 201 JSON + Location",
+                    s == 201
+                    and doc.get("title") == "The Matrix"
+                    and doc.get("imdb_id") == "tt0133093"  # imdbID -> snake_case
+                    and doc["ratings"][-1] == {"source": "Personal", "value": "9/10"}
+                    and "response" not in doc
+                    and headers.get("location") == "/movies/tt0133093",
+                )
+            )
 
             s, b = req("GET", "/movies")
             docs = json.loads(b)
-            results.append((
-                "GET /movies doc shape",
-                s == 200 and len(docs) == 1 and docs[0]["title"] == "The Matrix"
-                and docs[0]["ratings"][-1] == {"source": "Personal", "value": "9/10"}
-                and "response" not in docs[0]))
+            results.append(
+                (
+                    "GET /movies doc shape",
+                    s == 200
+                    and len(docs) == 1
+                    and docs[0]["title"] == "The Matrix"
+                    and docs[0]["ratings"][-1]
+                    == {"source": "Personal", "value": "9/10"}
+                    and "response" not in docs[0],
+                )
+            )
             s, _ = req("GET", "/movies/tt0133093")
             results.append(("GET /movies/{imdb_id}", s == 200))
             s, b = req("GET", "/movies?title=The+Matrix&year=1999")
-            results.append((
-                "GET /movies title+year filter",
-                s == 200 and len(json.loads(b)) == 1))
+            results.append(
+                ("GET /movies title+year filter", s == 200 and len(json.loads(b)) == 1)
+            )
             s, b = req("GET", "/movies?year=1999")
-            results.append((
-                "GET /movies single-param filter",
-                s == 200 and len(json.loads(b)) == 1))
+            results.append(
+                (
+                    "GET /movies single-param filter",
+                    s == 200 and len(json.loads(b)) == 1,
+                )
+            )
             # A filter matching nothing is an empty collection, not an error.
             s, b = req("GET", "/movies?title=No+Such+Movie&year=1900")
-            results.append(("GET /movies unmatched filter -> 200 []", s == 200 and json.loads(b) == []))
+            results.append(
+                (
+                    "GET /movies unmatched filter -> 200 []",
+                    s == 200 and json.loads(b) == [],
+                )
+            )
 
             # (title, year) isn't UNIQUE — a second movie sharing both is
             # ordinary filter output (both rows), not an error and not a
             # silent pick of one of them.
             dup_db = sqlite3.connect(db_path)
-            dup_db.execute("INSERT INTO movies VALUES (?, ?)", ("tt0133093-dup", json.dumps(
-                {"title": "The Matrix", "year": "1999", "ratings": []})))
+            dup_db.execute(
+                "INSERT INTO movies VALUES (?, ?)",
+                (
+                    "tt0133093-dup",
+                    json.dumps({"title": "The Matrix", "year": "1999", "ratings": []}),
+                ),
+            )
             dup_db.commit()
             dup_db.close()
             s, b = req("GET", "/movies?title=The+Matrix&year=1999")
-            ids = sorted(d.get("imdb_id", "dup-has-none") for d in json.loads(b)) if s == 200 else []
-            results.append((
-                "duplicate title+year filter returns both",
-                s == 200 and len(ids) == 2 and "tt0133093" in ids))
+            ids = (
+                sorted(d.get("imdb_id", "dup-has-none") for d in json.loads(b))
+                if s == 200
+                else []
+            )
+            results.append(
+                (
+                    "duplicate title+year filter returns both",
+                    s == 200 and len(ids) == 2 and "tt0133093" in ids,
+                )
+            )
             s, _ = req("GET", "/movies/tt0133093-dup")
             results.append(("GET /movies/{imdb_id} still works for dup", s == 200))
             dup_db = sqlite3.connect(db_path)
@@ -175,10 +241,15 @@ def main():
             results.append(("404 unknown id", s == 404))
             s, b = req("GET", "/movies/tt0133093/history")
             h = json.loads(b)
-            results.append((
-                "GET history shape+timestamp",
-                s == 200 and h["imdb_id"] == "tt0133093" and len(h["snapshots"]) == 2
-                and h["snapshots"][0]["observed"].endswith("+00:00")))
+            results.append(
+                (
+                    "GET history shape+timestamp",
+                    s == 200
+                    and h["imdb_id"] == "tt0133093"
+                    and len(h["snapshots"]) == 2
+                    and h["snapshots"][0]["observed"].endswith("+00:00"),
+                )
+            )
             s, _ = req("GET", "/movies/tt9999999/history")
             results.append(("404 history for unknown id", s == 404))
 
@@ -186,7 +257,9 @@ def main():
             # invalid request does (422 JSON), not axum's default rejection
             # (400 plain text) — previously a documented gap, now closed.
             s, b = req("POST", "/movies?title=The+Matrix")  # rating & year missing
-            results.append(("422 JSON on malformed POST params", s == 422 and "detail" in b))
+            results.append(
+                ("422 JSON on malformed POST params", s == 422 and "detail" in b)
+            )
 
             # Present-but-empty params are as unresolvable as missing ones —
             # 422, not a pass-through to OMDB and whatever it answers.
@@ -197,18 +270,26 @@ def main():
             # problem, not the caller's — 503 + Retry-After, not 429. The
             # distinct problem `type` is what lets clients tell this 503
             # from the at-capacity one without parsing `detail` prose.
-            s, b, headers = req_full("POST", "/movies?title=TriggerDailyLimit&rating=1&year=2000")
+            s, b, headers = req_full(
+                "POST", "/movies?title=TriggerDailyLimit&rating=1&year=2000"
+            )
             prob = json.loads(b)
-            results.append((
-                "503 + Retry-After + type URN on OMDB daily limit",
-                s == 503 and "daily request limit" in prob["detail"].lower()
-                and prob["type"] == "urn:moviedb:problem:omdb-quota-exhausted"
-                and headers.get("retry-after") == "86400"))
+            results.append(
+                (
+                    "503 + Retry-After + type URN on OMDB daily limit",
+                    s == 503
+                    and "daily request limit" in prob["detail"].lower()
+                    and prob["type"] == "urn:moviedb:problem:omdb-quota-exhausted"
+                    and headers.get("retry-after") == "86400",
+                )
+            )
 
             # An OMDB error this server doesn't recognize is a bad response
             # from an upstream dependency — 502, not the non-standard 520.
             s, b = req("POST", "/movies?title=TriggerUnknownError&rating=1&year=2000")
-            results.append(("502 on unrecognized OMDB error", s == 502 and "detail" in b))
+            results.append(
+                ("502 on unrecognized OMDB error", s == 502 and "detail" in b)
+            )
 
             # Re-POSTing an already-stored imdb_id is an update, not a
             # create: 200, not 201 — and the new rating replaces the old one.
@@ -217,66 +298,117 @@ def main():
             # precision timestamps used to, silently dropping it).
             s, b = req("POST", "/movies?title=The+Matrix&rating=9.5/10&year=1999")
             doc = json.loads(b) if s == 200 else {}
-            results.append((
-                "POST updates existing movie -> 200 JSON",
-                s == 200 and doc.get("ratings", [{}])[-1] == {"source": "Personal", "value": "9.5/10"}))
+            results.append(
+                (
+                    "POST updates existing movie -> 200 JSON",
+                    s == 200
+                    and doc.get("ratings", [{}])[-1]
+                    == {"source": "Personal", "value": "9.5/10"},
+                )
+            )
             s, b = req("GET", "/movies/tt0133093/history")
             h = json.loads(b)
-            results.append((
-                "update POST appended a second snapshot pair",
-                s == 200 and len(h["snapshots"]) == 4))
+            results.append(
+                (
+                    "update POST appended a second snapshot pair",
+                    s == 200 and len(h["snapshots"]) == 4,
+                )
+            )
 
             # /movies/recent is a bare array like GET /movies (the
             # envelope-free collection convention), with last_refreshed
             # folded into each doc, not carried on a wrapper object.
             s, b = req("GET", "/movies/recent?limit=5")
             recent = json.loads(b)
-            results.append((
-                "GET /movies/recent bare array + last_refreshed",
-                s == 200 and isinstance(recent, list) and len(recent) == 1
-                and recent[0]["imdb_id"] == "tt0133093"
-                and recent[0]["last_refreshed"].endswith("+00:00")))
+            results.append(
+                (
+                    "GET /movies/recent bare array + last_refreshed",
+                    s == 200
+                    and isinstance(recent, list)
+                    and len(recent) == 1
+                    and recent[0]["imdb_id"] == "tt0133093"
+                    and recent[0]["last_refreshed"].endswith("+00:00"),
+                )
+            )
 
             # limit=0 is a valid request for zero movies — the DB has one,
             # so [] proves it wasn't silently promoted to limit=1.
             s, b = req("GET", "/movies/recent?limit=0")
-            results.append(("GET /movies/recent?limit=0 -> []", s == 200 and json.loads(b) == []))
+            results.append(
+                ("GET /movies/recent?limit=0 -> []", s == 200 and json.loads(b) == [])
+            )
         finally:
             proc.terminate()
             proc.wait()
 
         # empty API_KEY must be a startup failure, not silently-open auth
         # (an empty x-api-key header is legal HTTP and would match it)
-        p = subprocess.run([BIN, "serve", "--port", "8124"],
-                           env=dict(env, API_KEY=""),
-                           capture_output=True, text=True, timeout=10)
-        results.append(("refuses empty API_KEY",
-                        p.returncode == 1 and "API_KEY" in p.stderr))
+        p = subprocess.run(
+            [BIN, "serve", "--port", "8124"],
+            env=dict(env, API_KEY=""),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        results.append(
+            ("refuses empty API_KEY", p.returncode == 1 and "API_KEY" in p.stderr)
+        )
 
         # refresh edge cases: null Personal Value skips without an OMDB call;
         # Response=True missing Title skips without persisting
         db = sqlite3.connect(db_path)
-        db.execute("INSERT INTO movies VALUES (?, ?)", ("tt0000001", json.dumps(
-            {"title": "NullVal", "year": "2001",
-             "ratings": [{"source": "Personal", "value": None}]})))
-        b_doc = json.dumps({"title": "TitleGone", "year": "2003",
-                            "ratings": [{"source": "Personal", "value": "8/10"}]})
+        db.execute(
+            "INSERT INTO movies VALUES (?, ?)",
+            (
+                "tt0000001",
+                json.dumps(
+                    {
+                        "title": "NullVal",
+                        "year": "2001",
+                        "ratings": [{"source": "Personal", "value": None}],
+                    }
+                ),
+            ),
+        )
+        b_doc = json.dumps(
+            {
+                "title": "TitleGone",
+                "year": "2003",
+                "ratings": [{"source": "Personal", "value": "8/10"}],
+            }
+        )
         db.execute("INSERT INTO movies VALUES (?, ?)", ("tt0000002", b_doc))
         db.commit()
         db.close()
 
-        out = subprocess.run([BIN, "refresh", db_path, "--sleep", "0"],
-                             env=env, capture_output=True, text=True)
+        out = subprocess.run(
+            [BIN, "refresh", db_path, "--sleep", "0"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
         db = sqlite3.connect(db_path)
         b_after = db.execute(
-            "SELECT data FROM movies WHERE imdb_id='tt0000002'").fetchone()[0]
-        results.append(("refresh: null Personal Value skipped",
-                        "SKIP NullVal: no Personal rating" in out.stdout))
-        results.append(("refresh: missing Title not persisted",
-                        "missing Title" in out.stdout and b_after == b_doc))
-        results.append(("refresh: The Matrix refreshed",
-                        "OK   The Matrix (1999)" in out.stdout
-                        and out.returncode == 0))
+            "SELECT data FROM movies WHERE imdb_id='tt0000002'"
+        ).fetchone()[0]
+        results.append(
+            (
+                "refresh: null Personal Value skipped",
+                "SKIP NullVal: no Personal rating" in out.stdout,
+            )
+        )
+        results.append(
+            (
+                "refresh: missing Title not persisted",
+                "missing Title" in out.stdout and b_after == b_doc,
+            )
+        )
+        results.append(
+            (
+                "refresh: The Matrix refreshed",
+                "OK   The Matrix (1999)" in out.stdout and out.returncode == 0,
+            )
+        )
         db.close()
 
     ok = True
