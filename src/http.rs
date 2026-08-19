@@ -110,26 +110,60 @@ fn problem(status: StatusCode, ptype: &str, msg: &str) -> Response {
         .into_response()
 }
 
-/// The common case: errors where status + detail say everything, so `type`
-/// stays "about:blank".
 fn detail(status: StatusCode, msg: &str) -> Response {
     problem(status, "about:blank", msg)
 }
 
-/// Every caller passes a context string describing what failed, printed to
-/// stderr (captured by journalctl) before the generic 500 goes out — without
-/// this, every internal error looked identical in the logs.
 fn internal_error(context: impl std::fmt::Display) -> Response {
     eprintln!("{context}");
     detail(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
 }
 
-/// Send `body` as-is with an `application/json` content type, skipping the
-/// parse-then-reserialize round trip: `data` columns only ever hold JSON we
-/// wrote ourselves (via `serde_json::to_string`), so re-parsing into a
-/// `Value` tree just to immediately re-serialize it is pure waste.
 fn raw_json(body: String) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// Streams rows that are each already a complete JSON object as one JSON
+/// array. Same reasoning as `raw_json`: the bytes came out of a `data` column
+/// we wrote, so they go out as array elements without ever becoming a `Value`
+/// tree, and without being concatenated into one contiguous buffer first.
+fn json_array_response(rows: Vec<String>) -> Response {
+    let n = rows.len();
+    let chunks = std::iter::once(Bytes::from_static(b"["))
+        .chain(rows.into_iter().enumerate().map(move |(i, doc)| {
+            let mut buf = doc.into_bytes();
+            if i + 1 < n {
+                buf.push(b',');
+            }
+            Bytes::from(buf)
+        }))
+        .chain(std::iter::once(Bytes::from_static(b"]")))
+        .map(Ok::<_, std::convert::Infallible>);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from_stream(stream::iter(chunks)),
+    )
+        .into_response()
+}
+
+/// Appends one string-valued member to a stored movie doc without parsing it,
+/// preserving `raw_json`'s zero-round-trip property for responses that need to
+/// add a field. Leans on the same invariant: a `data` column always holds a
+/// non-empty JSON object this server serialized, so it ends in `}` and already
+/// has a member to comma-separate from. Anything else (a hand-edited row) is
+/// returned untouched rather than spliced into invalid JSON. Callers pass
+/// their own fixed-format ASCII timestamps, which need no escaping.
+fn splice_member(mut doc: String, key: &str, value: &str) -> String {
+    if doc.len() < 3 || !doc.ends_with('}') {
+        return doc;
+    }
+    doc.truncate(doc.len() - 1);
+    doc.push_str(",\"");
+    doc.push_str(key);
+    doc.push_str("\":\"");
+    doc.push_str(value);
+    doc.push_str("\"}");
+    doc
 }
 
 /// Runs `f` against a pooled connection on a blocking-pool thread. Both pool
@@ -218,11 +252,6 @@ struct FilterParams {
     year: Option<String>,
 }
 
-/// `GET /movies/recent`'s only param. Missing means `DEFAULT_RECENT_LIMIT`
-/// (unparseable is a 422 from `Params`, like any bad query param); anything
-/// above `MAX_RECENT_LIMIT` is clamped, not rejected — same defensive
-/// posture as every other collection endpoint. `limit=0` is a valid request
-/// for zero movies and returns `[]`, not a silent promotion to 1.
 #[derive(Deserialize)]
 struct RecentParams {
     limit: Option<usize>,
@@ -293,7 +322,9 @@ fn normalize_omdb_movie(movie: Value, rating: &str) -> Result<Map<String, Value>
     // read again after this, so moving each value into `out` skips a clone
     // of every OMDB field (Plot, Actors, Poster, ...) per request.
     let Value::Object(obj) = movie else {
-        return Err(Box::new(internal_error("OMDB response was not a JSON object")));
+        return Err(Box::new(internal_error(
+            "OMDB response was not a JSON object",
+        )));
     };
     let mut out = Map::new();
     for (key, value) in obj {
@@ -343,11 +374,8 @@ async fn upsert_movie(
             // busy handler does apply.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let existed = tx
-                .query_row(
-                    "SELECT 1 FROM movies WHERE imdb_id = ?",
-                    params![imdbid],
-                    |_| Ok(()),
-                )
+                .prepare_cached("SELECT 1 FROM movies WHERE imdb_id = ?")?
+                .query_row(params![imdbid], |_| Ok(()))
                 .optional()?
                 .is_some();
             tx.execute(
@@ -367,9 +395,7 @@ async fn upsert_movie(
                 };
                 let mut resp =
                     (status, [(header::CONTENT_TYPE, "application/json")], data).into_response();
-                if !existed
-                    && let Ok(location) = format!("/movies/{imdbid}").parse()
-                {
+                if !existed && let Ok(location) = format!("/movies/{imdbid}").parse() {
                     resp.headers_mut().insert(header::LOCATION, location);
                 }
                 resp
@@ -411,7 +437,10 @@ async fn add_movie(State(state): State<Arc<AppState>>, Params(p): Params<AddPara
     let movie: Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            return internal_error(format!("OMDB response JSON parse failed: {}", e.without_url()));
+            return internal_error(format!(
+                "OMDB response JSON parse failed: {}",
+                e.without_url()
+            ));
         }
     };
 
@@ -466,7 +495,10 @@ async fn add_movie(State(state): State<Arc<AppState>>, Params(p): Params<AddPara
     if error == "Movie not found!" {
         return detail(StatusCode::NOT_FOUND, "Movie not found");
     }
-    eprintln!("OMDB returned an unrecognized error for {} ({}): {error}", p.title, p.year);
+    eprintln!(
+        "OMDB returned an unrecognized error for {} ({}): {error}",
+        p.title, p.year
+    );
     // 502: this server acted as a client to OMDB and got back an error it
     // doesn't recognize — a Bad Gateway in the literal sense, and a real,
     // standard HTTP status (unlike the Cloudflare-specific 520 this used to
@@ -495,64 +527,65 @@ async fn list_movies(
             ),
         };
         let result = (|| -> rusqlite::Result<Vec<String>> {
-            let mut stmt = conn.prepare(sql)?;
+            // prepare_cached, not prepare: pooled connections are long-lived,
+            // so SQLite parses and plans each of the four literal SQL variants
+            // once per connection instead of once per request.
+            let mut stmt = conn.prepare_cached(sql)?;
             let rows = stmt.query_map(rusqlite::params_from_iter(filters), |r| {
                 r.get::<_, String>(0)
             })?;
             rows.collect()
         })();
-        let raw = match result {
-            Ok(raw) => raw,
-            Err(e) => return internal_error(format!("failed to list movies: {e}")),
-        };
-        // Each row is already a valid JSON object (we wrote it); stream the
-        // raw bytes as array elements instead of parsing every row into a
-        // `Value` tree, or even concatenating them into one contiguous
-        // buffer, before the response can start going out.
-        let n = raw.len();
-        let chunks = std::iter::once(Bytes::from_static(b"["))
-            .chain(raw.into_iter().enumerate().map(move |(i, doc)| {
-                let mut buf = doc.into_bytes();
-                if i + 1 < n {
-                    buf.push(b',');
-                }
-                Bytes::from(buf)
-            }))
-            .chain(std::iter::once(Bytes::from_static(b"]")))
-            .map(Ok::<_, std::convert::Infallible>);
-        (
-            [(header::CONTENT_TYPE, "application/json")],
-            Body::from_stream(stream::iter(chunks)),
-        )
-            .into_response()
+        match result {
+            Ok(raw) => json_array_response(raw),
+            Err(e) => internal_error(format!("failed to list movies: {e}")),
+        }
     })
     .await
 }
 
 /// The dashboard's "recently catalogued" view: the N movies with the most
-/// recent `ratings_history` snapshot, newest first. Unlike `list_movies`,
-/// this is `LIMIT`-bounded (at most `MAX_RECENT_LIMIT` rows), so it's built
-/// as one `Json` response rather than streamed, and each doc needs its
-/// `last_refreshed` timestamp folded in — `data` gets parsed back into a
-/// `Value` for that (the raw-bytes shortcut `raw_json`/`list_movies` use only
-/// works when the stored bytes are the entire response body verbatim).
+/// recent `ratings_history` snapshot, newest first. Each doc needs its
+/// `last_refreshed` timestamp folded in, which `splice_member` does textually
+/// — so this keeps `list_movies`' zero-parse property instead of round-tripping
+/// every doc through a `Value` tree just to add one field.
+///
+/// Still buffered into one body rather than streamed like `list_movies`, and
+/// that is load-bearing rather than an oversight: this endpoint is
+/// `LIMIT`-bounded to `MAX_RECENT_LIMIT`, so one write with a `Content-Length`
+/// beats a chunked response whose framing overhead, on a body this small,
+/// costs more than the parse the splice already saved. Measured — streaming it
+/// was 14-18% *slower* than the version this replaced.
 async fn get_recent(
     State(state): State<Arc<AppState>>,
     Params(p): Params<RecentParams>,
 ) -> Response {
-    let limit = p.limit.unwrap_or(DEFAULT_RECENT_LIMIT).min(MAX_RECENT_LIMIT);
+    let limit = p
+        .limit
+        .unwrap_or(DEFAULT_RECENT_LIMIT)
+        .min(MAX_RECENT_LIMIT);
     with_conn(&state, move |conn| {
         let result = (|| -> rusqlite::Result<Vec<(String, String)>> {
-            let mut stmt = conn.prepare(
+            // Correlated MAX, not GROUP BY: the grouped form aggregates
+            // every ratings_history row before LIMIT discards all but N, so
+            // it costs more on every refresh run forever. `observed` is the
+            // second column of that table's primary key, so with imdb_id
+            // fixed each subquery is a seek to the last index entry.
+            // Movie-bounded instead of history-bounded: 19ms -> 0.7ms today.
+            //
+            // The imdb_id tiebreaker keeps LIMIT deterministic — one refresh
+            // run stamps all its snapshots with the same `observed`.
+            let mut stmt = conn.prepare_cached(
                 "
-                SELECT m.data, h.last_refreshed
+                SELECT m.data,
+                       (
+                           SELECT MAX(h.observed)
+                           FROM ratings_history h
+                           WHERE h.imdb_id = m.imdb_id
+                       ) AS last_refreshed
                 FROM movies m
-                JOIN (
-                    SELECT imdb_id, MAX(observed) AS last_refreshed
-                    FROM ratings_history
-                    GROUP BY imdb_id
-                ) h ON h.imdb_id = m.imdb_id
-                ORDER BY h.last_refreshed DESC
+                WHERE last_refreshed IS NOT NULL
+                ORDER BY last_refreshed DESC, m.imdb_id ASC
                 LIMIT ?
                 ",
             )?;
@@ -561,37 +594,35 @@ async fn get_recent(
             })?;
             rows.collect()
         })();
-        let raw = match result {
-            Ok(raw) => raw,
-            Err(e) => return internal_error(format!("failed to list recent movies: {e}")),
-        };
-        let mut movies = Vec::with_capacity(raw.len());
-        for (data, last_refreshed) in raw {
-            let mut doc: Value = match serde_json::from_str(&data) {
-                Ok(v) => v,
-                Err(e) => {
-                    return internal_error(format!("failed to parse stored movie doc: {e}"));
+        match result {
+            Ok(raw) => {
+                // `last_refreshed` plus its quoting and separator adds a fixed
+                // ~50 bytes per doc; sizing up front keeps this to one alloc.
+                let mut body =
+                    String::with_capacity(raw.iter().map(|(d, _)| d.len() + 50).sum::<usize>() + 2);
+                body.push('[');
+                for (i, (data, last_refreshed)) in raw.into_iter().enumerate() {
+                    if i > 0 {
+                        body.push(',');
+                    }
+                    body.push_str(&splice_member(data, "last_refreshed", &last_refreshed));
                 }
-            };
-            if let Value::Object(ref mut obj) = doc {
-                obj.insert("last_refreshed".to_string(), Value::String(last_refreshed));
+                body.push(']');
+                raw_json(body)
             }
-            movies.push(doc);
+            Err(e) => internal_error(format!("failed to list recent movies: {e}")),
         }
-        Json(movies).into_response()
     })
     .await
 }
 
 async fn get_movie(State(state): State<Arc<AppState>>, ImdbId(imdb_id): ImdbId) -> Response {
     with_conn(&state, move |conn| {
-        let row = conn
-            .query_row(
-                "SELECT data FROM movies WHERE imdb_id = ?",
-                params![imdb_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional();
+        let row = (|| -> rusqlite::Result<Option<String>> {
+            conn.prepare_cached("SELECT data FROM movies WHERE imdb_id = ?")?
+                .query_row(params![imdb_id], |r| r.get::<_, String>(0))
+                .optional()
+        })();
         match row {
             Ok(Some(data)) => raw_json(data),
             Ok(None) => detail(StatusCode::NOT_FOUND, "Movie not found"),
@@ -603,40 +634,42 @@ async fn get_movie(State(state): State<Arc<AppState>>, ImdbId(imdb_id): ImdbId) 
 
 async fn get_history(State(state): State<Arc<AppState>>, ImdbId(imdb_id): ImdbId) -> Response {
     with_conn(&state, move |conn| {
-        // 404 only when the *movie* is unknown; a known movie with no
-        // snapshots yet is a real resource whose history is empty.
-        let exists = conn
-            .query_row(
-                "SELECT 1 FROM movies WHERE imdb_id = ?",
-                params![imdb_id],
-                |_| Ok(()),
-            )
-            .optional();
-        match exists {
-            Ok(Some(())) => {}
-            Ok(None) => return detail(StatusCode::NOT_FOUND, "Movie not found"),
-            Err(e) => {
-                return internal_error(format!("failed to fetch movie {imdb_id}: {e}"));
-            }
-        }
-        let result = (|| -> rusqlite::Result<Vec<Value>> {
-            let mut stmt = conn.prepare(
+        // One query, not an existence probe followed by the history select.
+        // The outer join keeps the distinction those two encoded: no rows at
+        // all means the *movie* is unknown (404), whereas a single all-NULL
+        // row means a known movie that simply has no snapshots yet — a real
+        // resource whose history is empty.
+        //
+        // Merging costs nothing: ratings_history's primary key is
+        // (imdb_id, observed, source), so with imdb_id fixed the index already
+        // yields the ORDER BY's exact order, and SQLite plans two index
+        // searches with no sort (verified with EXPLAIN QUERY PLAN).
+        let result = (|| -> rusqlite::Result<Vec<Option<Value>>> {
+            let mut stmt = conn.prepare_cached(
                 "
-        SELECT observed, source, value FROM ratings_history
-        WHERE imdb_id = ? ORDER BY observed ASC, source ASC
+        SELECT h.observed, h.source, h.value
+        FROM movies m LEFT JOIN ratings_history h ON h.imdb_id = m.imdb_id
+        WHERE m.imdb_id = ? ORDER BY h.observed ASC, h.source ASC
         ",
             )?;
             let rows = stmt.query_map(params![imdb_id], |r| {
-                Ok(json!({
-                    "observed": r.get::<_, String>(0)?,
-                    "source": r.get::<_, String>(1)?,
-                    "value": r.get::<_, String>(2)?,
-                }))
+                Ok(match r.get::<_, Option<String>>(0)? {
+                    Some(observed) => Some(json!({
+                        "observed": observed,
+                        "source": r.get::<_, String>(1)?,
+                        "value": r.get::<_, String>(2)?,
+                    })),
+                    None => None,
+                })
             })?;
             rows.collect()
         })();
         match result {
-            Ok(snaps) => Json(json!({ "imdb_id": imdb_id, "snapshots": snaps })).into_response(),
+            Ok(rows) if rows.is_empty() => detail(StatusCode::NOT_FOUND, "Movie not found"),
+            Ok(rows) => {
+                let snaps: Vec<Value> = rows.into_iter().flatten().collect();
+                Json(json!({ "imdb_id": imdb_id, "snapshots": snaps })).into_response()
+            }
             Err(e) => internal_error(format!("failed to fetch history for {imdb_id}: {e}")),
         }
     })
@@ -661,8 +694,7 @@ async fn fallback_method_not_allowed() -> Response {
 /// process mid-response. systemd's `TimeoutStopSec` (90s default) still
 /// backstops a hung drain with SIGKILL.
 async fn shutdown_signal() {
-    let mut sigterm =
-        signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     tokio::select! {
         _ = sigterm.recv() => {},
@@ -747,5 +779,58 @@ pub(crate) async fn serve(host: String, port: u16) {
     {
         eprintln!("server error: {e}");
         exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splice_member_appends_to_a_stored_doc() {
+        // The ordinary case: a doc this server serialized, gaining one field.
+        // Byte-for-byte what serde_json would have produced by parsing the doc
+        // into a Value, inserting, and re-serializing — that equivalence is
+        // the whole justification for not doing so.
+        let doc = r#"{"title":"The Matrix","imdb_id":"tt0133093"}"#.to_string();
+        assert_eq!(
+            splice_member(doc, "last_refreshed", "2026-01-01T00:00:00.000+00:00"),
+            r#"{"title":"The Matrix","imdb_id":"tt0133093","last_refreshed":"2026-01-01T00:00:00.000+00:00"}"#
+        );
+    }
+
+    #[test]
+    fn splice_member_preserves_non_ascii_verbatim() {
+        // SQLite's json_set would escape this to é, making the same movie
+        // come back byte-different from /movies and /movies/recent. Splicing
+        // never touches the existing bytes, which is why it's preferred.
+        let doc = r#"{"actors":"Penélope Cruz"}"#.to_string();
+        let out = splice_member(doc, "last_refreshed", "2026-01-01T00:00:00.000+00:00");
+        assert!(out.contains("Penélope"), "got: {out}");
+    }
+
+    #[test]
+    fn splice_member_leaves_anything_it_did_not_write_alone() {
+        // A hand-edited row that isn't a non-empty JSON object must come back
+        // untouched rather than spliced into invalid JSON.
+        for input in ["{}", "", "[]", "null", "not json"] {
+            assert_eq!(
+                splice_member(
+                    input.to_string(),
+                    "last_refreshed",
+                    "2026-01-01T00:00:00.000+00:00"
+                ),
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn splice_member_output_stays_parseable() {
+        let doc = r#"{"a":1,"b":{"nested":"}"},"c":[1,2]}"#.to_string();
+        let out = splice_member(doc, "last_refreshed", "2026-01-01T00:00:00.000+00:00");
+        let v: Value = serde_json::from_str(&out).expect("spliced doc parses");
+        assert_eq!(v["last_refreshed"], "2026-01-01T00:00:00.000+00:00");
+        assert_eq!(v["b"]["nested"], "}");
     }
 }

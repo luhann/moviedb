@@ -46,7 +46,7 @@ parsing `detail`.
 
 ```bash
 cargo build --release
-# -> target/x86_64-unknown-linux-musl/release/moviedb  (static-pie, ~5MB)
+# -> target/x86_64-unknown-linux-musl/release/moviedb  (static-pie, ~5.5MB)
 python3 tests/smoke_test.py     # full end-to-end check before pushing
 ```
 
@@ -169,7 +169,6 @@ pct push 401 target/x86_64-unknown-linux-musl/release/moviedb /opt/moviedb/movie
 ## Routing
 
 Up to you. I use [traefik](https://github.com/traefik/traefik) as my reverse proxy, but any way you request from the API will work.
-
 
 ## Notes (vs. the Lambdas)
 

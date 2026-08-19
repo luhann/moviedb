@@ -9,27 +9,14 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, params};
 use serde_json::Value;
 
-// SQLite's WAL mode natively supports many concurrent readers alongside one
-// writer; a pool lets GET / GET /single / GET /history actually use that
-// instead of queuing behind a single in-process lock (see commit message /
-// CLAUDE.md for the benchmark that found this serializing every GET).
-// Generous for a single-user service — sized so a handful of concurrent
-// requests never wait on pool checkout, not for real multi-user load.
 pub(crate) const DB_POOL_SIZE: u32 = 8;
 
-/// `busy_timeout` and synchronous reset per-connection (unlike `journal_mode`,
-/// which is sticky in the DB file itself) — serve and refresh are separate
-/// processes/connections, so both must set these independently.
 pub(crate) fn set_connection_pragmas(db: &mut Connection) -> rusqlite::Result<()> {
-    // SQLite's default busy_timeout of 0 turns any write collision between
-    // the two processes into an instant SQLITE_BUSY. Writers hold the lock
-    // ~1ms; retry up to 5s.
     db.busy_timeout(Duration::from_secs(5))?;
-    // Under WAL (see journal_mode below), NORMAL skips the fsync that FULL
-    // does on every commit — still crash-safe against corruption, the only
-    // risk is losing the last commit or two on an OS crash / power loss.
-    // An acceptable trade for a personal, backed-up movie tracker.
     db.pragma_update(None, "synchronous", "NORMAL")?;
+    db.pragma_update(None, "mmap_size", 64 * 1024 * 1024)?;
+    db.pragma_update(None, "cache_size", -8 * 1024)?;
+    db.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())
 }
 
@@ -53,6 +40,13 @@ fn init_db(path: &str) -> rusqlite::Result<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_movies_title_year ON movies (title, year)",
         [],
     )?;
+    // `year` is the *second* column of the composite index above, so a
+    // year-only filter (GET /movies?year=) can't use it and full-scans,
+    // recomputing json_extract for the VIRTUAL column on every row.
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_movies_year ON movies (year)",
+        [],
+    )?;
     db.execute(
         "
         CREATE TABLE IF NOT EXISTS ratings_history (
@@ -69,21 +63,11 @@ fn init_db(path: &str) -> rusqlite::Result<Connection> {
     Ok(db)
 }
 
-/// The bootstrap connection above creates the schema and puts the file into
-/// WAL mode, which is sticky in the file itself — every pooled connection
-/// opened afterward inherits it. Each of those still needs its own
-/// `busy_timeout`/synchronous set (see `set_connection_pragmas`), which
-/// `with_init` runs on every connection the pool creates.
 pub(crate) fn build_pool(
     path: &str,
 ) -> Result<Pool<SqliteConnectionManager>, Box<dyn std::error::Error>> {
     init_db(path)?;
     let manager = SqliteConnectionManager::file(path).with_init(set_connection_pragmas);
-    // Checkout never queues in normal operation — http::with_conn admits at
-    // most DB_POOL_SIZE tasks via semaphore before any pool.get() runs — so
-    // this timeout is only a backstop for slow connection *creation* (disk
-    // trouble). Far better to fail one request after 5s than r2d2's default
-    // of parking a blocking thread for 30s.
     Ok(Pool::builder()
         .max_size(DB_POOL_SIZE)
         .connection_timeout(Duration::from_secs(5))
@@ -107,17 +91,16 @@ pub(crate) fn snapshot_ratings(
     ratings: &[Value],
     observed: &str,
 ) -> rusqlite::Result<()> {
+    let mut stmt =
+        db.prepare_cached("INSERT OR IGNORE INTO ratings_history VALUES (?, ?, ?, ?, ?)")?;
     for r in ratings {
-        db.execute(
-            "INSERT OR IGNORE INTO ratings_history VALUES (?, ?, ?, ?, ?)",
-            params![
-                imdbid,
-                title,
-                observed,
-                ratings_entry_field(r, "source"),
-                ratings_entry_field(r, "value"),
-            ],
-        )?;
+        stmt.execute(params![
+            imdbid,
+            title,
+            observed,
+            ratings_entry_field(r, "source"),
+            ratings_entry_field(r, "value"),
+        ])?;
     }
     Ok(())
 }
@@ -164,8 +147,14 @@ mod tests {
             json!({ "source": "IMDb", "value": "8.7/10" }),
             json!({ "source": "Personal", "value": "9/10" }),
         ];
-        snapshot_ratings(&db, "tt0133093", "The Matrix", &ratings, "2026-01-01T00:00:00+00:00")
-            .unwrap();
+        snapshot_ratings(
+            &db,
+            "tt0133093",
+            "The Matrix",
+            &ratings,
+            "2026-01-01T00:00:00+00:00",
+        )
+        .unwrap();
 
         let count: i64 = db
             .query_row("SELECT COUNT(*) FROM ratings_history", [], |r| r.get(0))
@@ -199,5 +188,11 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |r| r.get(0))
             .unwrap();
         assert_eq!(synchronous, 1);
+        // MEMORY == 2 (https://www.sqlite.org/pragma.html#pragma_temp_store)
+        let temp_store: i64 = db.query_row("PRAGMA temp_store", [], |r| r.get(0)).unwrap();
+        assert_eq!(temp_store, 2);
+        // Negative values are a KiB budget, echoed back as set.
+        let cache_size: i64 = db.query_row("PRAGMA cache_size", [], |r| r.get(0)).unwrap();
+        assert_eq!(cache_size, -8 * 1024);
     }
 }

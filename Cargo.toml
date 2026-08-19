@@ -2,7 +2,7 @@ cargo-features = ["codegen-backend"]
 
 [package]
 name = "moviedb"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 
 [dependencies]
@@ -16,10 +16,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# Already pulled in transitively by axum/hyper/reqwest; declared directly
-# only to stream GET / instead of buffering the whole table into one String.
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3

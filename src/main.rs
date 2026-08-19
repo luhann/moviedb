@@ -20,13 +20,11 @@ use clap::{Parser, Subcommand};
 
 use db::DB_POOL_SIZE;
 
-// Headroom above DB_POOL_SIZE for non-DB blocking work. In practice
-// reqwest's default resolver runs getaddrinfo — so an OMDB DNS lookup
-// never queues behind DB_POOL_SIZE in-flight DB tasks. That invariant only
-// holds because http::with_conn admits DB tasks to the blocking pool through
-// a DB_POOL_SIZE-permit semaphore (excess requests wait async-side, then
-// load-shed 503): at most DB_POOL_SIZE blocking threads ever do DB work, so
-// this headroom stays genuinely free for DNS. Sized for one user: POST / is
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Headroom above DB_POOL_SIZE for non-DB blocking work. At most DB_POOL_SIZE blocking
+// threads ever do DB work, so this headroom stays genuinely free for DNS. Sized for one user: POST / is
 // the only handler that resolves DNS, so 4 is already generous, and total
 // threads (workers + blocking pool) must stay comfortably under the systemd
 // unit's TasksMax=32.
@@ -65,18 +63,12 @@ enum Command {
 }
 
 fn main() {
-
     let cli = Cli::parse();
 
     // Every DB-touching handler runs its query on a spawn_blocking thread,
     // admitted by with_conn's DB_POOL_SIZE-permit semaphore — but tokio's
     // *blocking thread pool itself* defaults to a cap of 512, independent of
-    // DB_POOL_SIZE. Left uncapped, non-DB blocking work under a burst could
-    // still spin up far more OS threads than intended, quietly invalidating
-    // the "TasksMax=32 is sized for one user" assumption this LXC's systemd
-    // unit relies on. Capping it here ties the blocking pool back to the DB
-    // pool constant, plus BLOCKING_POOL_HEADROOM (see above) for the pool's
-    // other tenant, reqwest's DNS resolver.
+    // DB_POOL_SIZE.
     tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .enable_time()

@@ -245,7 +245,12 @@ async fn refresh_movie(
         if error == "Daily request limit reached!" {
             return RefreshOutcome::DailyLimitReached;
         }
-        println!("SKIP {} [{}]: {}", doc_str(&doc, "title", "?"), imdb_id, error);
+        println!(
+            "SKIP {} [{}]: {}",
+            doc_str(&doc, "title", "?"),
+            imdb_id,
+            error
+        );
         // An OMDB call was still made for this movie — sleep the same as
         // every other post-request path below, or a run full of
         // not-found/renamed titles hammers OMDB with no throttling at all.
@@ -272,7 +277,10 @@ async fn refresh_movie(
     let year = new_doc.get("year").and_then(Value::as_str).unwrap_or("?");
 
     if cfg.dry_run {
-        println!("DRY  {title} ({year}): {}", dry_run_diff(&doc, &new_ratings));
+        println!(
+            "DRY  {title} ({year}): {}",
+            dry_run_diff(&doc, &new_ratings)
+        );
         tokio::time::sleep(Duration::from_secs_f64(cfg.sleep_secs)).await;
         return RefreshOutcome::Refreshed;
     }
@@ -390,7 +398,11 @@ mod tests {
             "Ratings": [{"Source": "Internet Movie Database", "Value": "8.7/10"}],
             "Response": "True",
         });
-        let out = rebuild_doc(omdb.as_object().unwrap(), &json!("9/10"), "2026-01-01T00:00:00+00:00");
+        let out = rebuild_doc(
+            omdb.as_object().unwrap(),
+            &json!("9/10"),
+            "2026-01-01T00:00:00+00:00",
+        );
 
         assert_eq!(out.get("title"), Some(&json!("The Matrix")));
         assert_eq!(out.get("year"), Some(&json!("1999")));
