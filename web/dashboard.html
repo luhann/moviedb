@@ -224,7 +224,8 @@
   .legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
   .legend-line { width: 14px; height: 2px; flex: none; }
 
-  select.drift-select {
+  .combo { position: relative; max-width: 340px; }
+  input.combo-input {
     font-family: var(--font-sans);
     font-size: 12.5px;
     color: var(--ink);
@@ -232,7 +233,33 @@
     border: 1px solid var(--border-2);
     border-radius: 3px;
     padding: 5px 8px;
-    max-width: 100%;
+    width: 100%;
+  }
+  input.combo-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  input.combo-input:disabled { color: var(--ink-muted); }
+  .combo-list {
+    position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; right: 0;
+    max-height: 260px; overflow-y: auto;
+    margin: 0; padding: 4px 0; list-style: none;
+    background: var(--surface);
+    border: 1px solid var(--border-2);
+    border-radius: 3px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.16);
+  }
+  .combo-option {
+    font-family: var(--font-sans); font-size: 12.5px; color: var(--ink);
+    padding: 5px 9px; cursor: pointer; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .combo-option.active { background: var(--accent-soft); }
+  .combo-option[aria-selected="true"] { color: var(--accent); }
+  .combo-empty {
+    font-family: var(--font-sans); font-size: 12.5px; color: var(--ink-muted);
+    padding: 6px 9px;
   }
 
   svg.chart { display: block; width: 100%; height: auto; overflow: visible; }
@@ -529,8 +556,13 @@
         </div>
         <div class="index">02 / ratings_history</div>
       </div>
-      <label for="driftSelect" class="sr-only">Title to show rating drift for</label>
-      <select class="drift-select" id="driftSelect"></select>
+      <label for="driftSearch" class="sr-only">Title to show rating drift for</label>
+      <div class="combo">
+        <input class="combo-input" id="driftSearch" type="text" role="combobox" autocomplete="off"
+               spellcheck="false" aria-autocomplete="list" aria-expanded="false"
+               aria-controls="driftList" placeholder="Search titles…">
+        <ul class="combo-list" id="driftList" role="listbox" aria-label="Titles" hidden></ul>
+      </div>
       <div class="legend" id="driftLegend"></div>
       <div id="driftWrap"></div>
     </div>
@@ -611,8 +643,13 @@
       <div><h2>Title inspector</h2><p class="note">Everything catalogued for one title, straight from its stored document.</p></div>
       <div class="index">11 / movies</div>
     </div>
-    <label for="detailSelect" class="sr-only">Title to inspect</label>
-    <select class="drift-select" id="detailSelect"></select>
+    <label for="detailSearch" class="sr-only">Title to inspect</label>
+    <div class="combo">
+      <input class="combo-input" id="detailSearch" type="text" role="combobox" autocomplete="off"
+             spellcheck="false" aria-autocomplete="list" aria-expanded="false"
+             aria-controls="detailList" placeholder="Search titles…">
+      <ul class="combo-list" id="detailList" role="listbox" aria-label="Titles" hidden></ul>
+    </div>
     <div id="detailWrap"></div>
   </section>
 
@@ -1541,34 +1578,151 @@
     }
   }
 
+  // Type-to-filter picker over a fixed list: the input mirrors the chosen
+  // label, the listbox opens on focus and narrows as you type.
+  function createCombo({ input, list, onSelect }) {
+    let items = [];
+    let filtered = [];
+    let selected = null;
+    let active = -1;
+    let open = false;
+
+    const labelFor = (value) => {
+      const item = items.find((i) => i.value === value);
+      return item ? item.label : "";
+    };
+
+    function setActive(index) {
+      const prev = list.querySelector(".combo-option.active");
+      if (prev) prev.classList.remove("active");
+      active = index;
+      const el = index >= 0 ? list.children[index] : null;
+      if (!el || !el.classList.contains("combo-option")) {
+        active = -1;
+        input.removeAttribute("aria-activedescendant");
+        return;
+      }
+      el.classList.add("active");
+      el.scrollIntoView({ block: "nearest" });
+      input.setAttribute("aria-activedescendant", el.id);
+    }
+
+    function paint() {
+      clear(list);
+      if (!filtered.length) {
+        const li = document.createElement("li");
+        li.className = "combo-empty";
+        li.textContent = "No matching titles.";
+        list.appendChild(li);
+        return;
+      }
+      filtered.forEach((item, i) => {
+        const li = document.createElement("li");
+        li.className = "combo-option";
+        li.id = list.id + "-opt-" + i;
+        li.setAttribute("role", "option");
+        li.setAttribute("aria-selected", item.value === selected ? "true" : "false");
+        li.textContent = item.label;
+        li.onmousedown = (e) => { e.preventDefault(); choose(item); };
+        li.onmouseenter = () => setActive(i);
+        list.appendChild(li);
+      });
+    }
+
+    function openList(query) {
+      const q = query.trim().toLowerCase();
+      filtered = q ? items.filter((i) => i.haystack.includes(q)) : items.slice();
+      paint();
+      open = true;
+      list.hidden = false;
+      input.setAttribute("aria-expanded", "true");
+      const found = filtered.findIndex((i) => i.value === selected);
+      setActive(filtered.length ? (found >= 0 ? found : 0) : -1);
+    }
+
+    function close(restoreText) {
+      open = false;
+      list.hidden = true;
+      input.setAttribute("aria-expanded", "false");
+      input.removeAttribute("aria-activedescendant");
+      active = -1;
+      if (restoreText) input.value = labelFor(selected);
+    }
+
+    function choose(item) {
+      selected = item.value;
+      input.value = item.label;
+      close(false);
+      onSelect(item);
+    }
+
+    // mousedown, not click: the input's blur would close the list first — and
+    // swallowing it on the list itself keeps a scrollbar drag from closing it.
+    list.onmousedown = (e) => e.preventDefault();
+
+    input.oninput = () => openList(input.value);
+    input.onfocus = () => { input.select(); openList(""); };
+    input.onblur = () => close(true);
+    input.onkeydown = (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (!open) { openList(""); return; }
+        if (!filtered.length) return;
+        const step = e.key === "ArrowDown" ? 1 : -1;
+        setActive((active + step + filtered.length) % filtered.length);
+      } else if (e.key === "Enter") {
+        if (open && filtered[active]) { e.preventDefault(); choose(filtered[active]); }
+      } else if (e.key === "Escape") {
+        if (open) { e.preventDefault(); close(true); }
+      } else if (e.key === "Tab") {
+        close(true);
+      }
+    };
+
+    return function setItems(next, value) {
+      items = next.map((i) => ({ ...i, haystack: i.label.toLowerCase() }));
+      selected = items.some((i) => i.value === value) ? value : null;
+      input.disabled = !items.length;
+      input.placeholder = items.length ? "Search titles\u2026" : "No titles catalogued yet";
+      input.value = labelFor(selected);
+      if (open) openList("");
+    };
+  }
+
+  function movieItems(movies) {
+    return [...movies]
+      .sort((a, b) => a.title.localeCompare(b.title))
+      .map((m) => ({
+        value: m.imdb_id,
+        label: m.title + (releaseYear(m) ? " (" + releaseYear(m) + ")" : ""),
+        movie: m,
+      }));
+  }
+
   // Survives the full re-render that adding a title triggers, so picking a
   // title and then cataloguing another doesn't throw away your place.
   let detailSelected = null;
+  const setDetailItems = createCombo({
+    input: document.getElementById("detailSearch"),
+    list: document.getElementById("detailList"),
+    onSelect: (item) => {
+      detailSelected = item.value;
+      renderMovieDetail(item.movie);
+    },
+  });
+
   function renderInspector(movies, defaultImdbId) {
-    const select = document.getElementById("detailSelect");
-    clear(select);
     if (!movies.length) {
-      select.disabled = true;
+      setDetailItems([], null);
       renderMovieDetail(null);
       return;
     }
-    select.disabled = false;
-    const sorted = [...movies].sort((a, b) => a.title.localeCompare(b.title));
-    sorted.forEach((m) => {
-      const opt = document.createElement("option");
-      opt.value = m.imdb_id;
-      opt.textContent = m.title + (releaseYear(m) ? " (" + releaseYear(m) + ")" : "");
-      select.appendChild(opt);
-    });
+    const items = movieItems(movies);
     const kept = detailSelected && movies.some((m) => m.imdb_id === detailSelected) ? detailSelected : null;
-    const fallback = defaultImdbId && movies.some((m) => m.imdb_id === defaultImdbId) ? defaultImdbId : sorted[0].imdb_id;
+    const fallback = defaultImdbId && movies.some((m) => m.imdb_id === defaultImdbId) ? defaultImdbId : items[0].value;
     const chosen = kept || fallback;
-    select.value = chosen;
     detailSelected = chosen;
-    select.onchange = () => {
-      detailSelected = select.value;
-      renderMovieDetail(movies.find((m) => m.imdb_id === select.value) || null);
-    };
+    setDetailItems(items, chosen);
     renderMovieDetail(movies.find((m) => m.imdb_id === chosen) || null);
   }
 
@@ -1694,29 +1848,22 @@
     }
   }
 
+  const setDriftItems = createCombo({
+    input: document.getElementById("driftSearch"),
+    list: document.getElementById("driftList"),
+    onSelect: (item) => loadDrift(item.value, item.movie.title),
+  });
+
   function renderDriftSelector(movies, defaultImdbId) {
-    const select = document.getElementById("driftSelect");
-    clear(select);
     if (!movies.length) {
-      select.disabled = true;
+      setDriftItems([], null);
       emptyState(document.getElementById("driftWrap"), "Catalogue a title to see rating drift.");
       renderDriftLegend([]);
       return;
     }
-    select.disabled = false;
-    const sorted = [...movies].sort((a, b) => a.title.localeCompare(b.title));
-    sorted.forEach((m) => {
-      const opt = document.createElement("option");
-      opt.value = m.imdb_id;
-      opt.textContent = m.title + (releaseYear(m) ? " (" + releaseYear(m) + ")" : "");
-      select.appendChild(opt);
-    });
-    const chosen = defaultImdbId && movies.some((m) => m.imdb_id === defaultImdbId) ? defaultImdbId : sorted[0].imdb_id;
-    select.value = chosen;
-    select.onchange = () => {
-      const m = movies.find((mm) => mm.imdb_id === select.value);
-      loadDrift(select.value, m ? m.title : "");
-    };
+    const items = movieItems(movies);
+    const chosen = defaultImdbId && movies.some((m) => m.imdb_id === defaultImdbId) ? defaultImdbId : items[0].value;
+    setDriftItems(items, chosen);
     const chosenMovie = movies.find((m) => m.imdb_id === chosen);
     loadDrift(chosen, chosenMovie ? chosenMovie.title : "");
   }
