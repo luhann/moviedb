@@ -7,10 +7,10 @@ use std::process::exit;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use crate::db::{ratings_entry_field, set_connection_pragmas, snapshot_ratings};
-use crate::util::{DEFAULT_OMDB_URL, snake_case, snake_case_entry_keys, utcnow};
+use crate::util::{DEFAULT_OMDB_URL, normalize_omdb, utcnow};
 
 /// The first ratings entry with source == "Personal". A missing entry or a
 /// JSON-null value both mean "not rated yet" and should be skipped; an
@@ -25,35 +25,12 @@ fn personal_rating(doc: &Value) -> Option<Value> {
     None
 }
 
-/// Snake-cases every OMDB field name (matching the schema `movies.data` is
-/// stored and served in), folds `Ratings` into `ratings` with each entry's
-/// keys snake_cased, appends the preserved Personal rating, drops the
-/// now-redundant `response` field, and stamps `_refreshed` so the next
-/// run's oldest-first ordering advances.
+/// Normalizes a Response=True OMDB payload (via the shared `util::normalize_omdb`)
+/// and stamps `_refreshed` so the next run's oldest-first ordering advances.
+/// `personal_value` is passed through as-is (not stringified) so a
+/// non-string Personal rating from a hand-edited DB row round-trips correctly.
 fn rebuild_doc(omdb: &Map<String, Value>, personal_value: &Value, now: &str) -> Map<String, Value> {
-    let mut out = Map::new();
-    for (key, value) in omdb {
-        if key == "Ratings" {
-            out.insert(
-                "ratings".to_string(),
-                Value::Array(snake_case_entry_keys(
-                    value.as_array().cloned().unwrap_or_default(),
-                )),
-            );
-        } else {
-            out.insert(snake_case(key), value.clone());
-        }
-    }
-    if !out.contains_key("ratings") {
-        out.insert("ratings".to_string(), Value::Array(Vec::new()));
-    }
-    out.get_mut("ratings")
-        .and_then(Value::as_array_mut)
-        .expect("ratings is a list")
-        .push(json!({ "source": "Personal", "value": personal_value }));
-    // shift_remove, not remove: with preserve_order, plain remove is a
-    // swap_remove and would scramble the remaining keys' order.
-    out.shift_remove("response");
+    let mut out = normalize_omdb(omdb.clone(), personal_value.clone());
     out.insert("_refreshed".to_string(), Value::String(now.to_string()));
     out
 }
@@ -99,6 +76,21 @@ fn dry_run_diff(old_doc: &Value, new_ratings: &[Value]) -> String {
             None => changed.push(format!("{s}: (new) -> {v}")),
         }
     }
+    // Sources present in the old doc but absent from the fresh fetch —
+    // the loop above only walks new_ratings, so without this a source
+    // OMDB dropped vanishes from the diff instead of being reported.
+    let mut removed: Vec<String> = Vec::new();
+    for (s, old_v) in &old {
+        if *s == "Personal" {
+            continue;
+        }
+        if !new_pairs.iter().any(|(k, _)| *k == *s) {
+            removed.push(format!("{s}: {old_v} -> (removed)"));
+        }
+    }
+    removed.sort();
+    changed.extend(removed);
+
     if changed.is_empty() {
         "no rating changes".to_string()
     } else {
@@ -474,6 +466,25 @@ mod tests {
         assert_eq!(
             dry_run_diff(&old, &new_ratings),
             r#"IMDb: "8.7/10" -> "8.8/10", Rotten Tomatoes: (new) -> "95%""#
+        );
+    }
+
+    #[test]
+    fn dry_run_diff_reports_removed_sources() {
+        // A source present in the old doc but absent from the fresh fetch
+        // must show up in the diff, not vanish silently.
+        let old = json!({"ratings": [
+            {"source": "IMDb", "value": "8.7/10"},
+            {"source": "Rotten Tomatoes", "value": "95%"},
+            {"source": "Personal", "value": "9/10"},
+        ]});
+        let new_ratings = vec![
+            json!({"source": "IMDb", "value": "8.7/10"}),
+            json!({"source": "Personal", "value": "9/10"}),
+        ];
+        assert_eq!(
+            dry_run_diff(&old, &new_ratings),
+            r#"Rotten Tomatoes: "95%" -> (removed)"#
         );
     }
 }

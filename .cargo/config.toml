@@ -8,6 +8,13 @@ target = "x86_64-unknown-linux-musl"
 [env]
 LIBSQLITE3_FLAGS = "-DSQLITE_DISABLE_LFS"
 
+# This workstation's Gentoo profile exports CFLAGS="-march=native ...", which
+# cc-rs picks up for sqlite3.c and mimalloc — baking Zen 3 instructions into a
+# binary that has to run on the deploy target's Coffee Lake i5. force = true so
+# the ambient value can't leak in. See the target-cpu note below.
+CFLAGS = { value = "-O2", force = true }
+CXXFLAGS = { value = "-O2", force = true }
+
 # Statically link the C runtime for MUSL targets. At the time of writing (2026-06-01), this is
 # the default. But the plan is for the default to change to dynamic linking.
 # The whole point of MUSL here is a fully statically linked executable — the
@@ -18,8 +25,17 @@ LIBSQLITE3_FLAGS = "-DSQLITE_DISABLE_LFS"
 # See: https://github.com/rust-lang/compiler-team/issues/422#issuecomment-812135847
 [target.x86_64-unknown-linux-musl]
 linker = "clang"
+
+# target-cpu is pinned, not native: the build workstation is a Zen 3 Ryzen and
+# the cluster is Intel, so a native build dies with SIGILL on the first AMD-only
+# instruction (`extrq`, SSE4a) — which sits in hyper-util's connector, i.e. every
+# outbound OMDB call. v3 is the floor for the oldest node that will ever host
+# this (an i7-7700, Kaby Lake: AVX2/BMI2/FMA/F16C all present), so it holds
+# wherever the container migrates. NOTE: a RUSTFLAGS in the environment replaces
+# this list wholesale — scripts/deploy.sh unsets it for exactly that reason.
 rustflags = [
   "-Z", "threads=8",
+  "-C", "target-cpu=x86-64-v3",
   "-C", "target-feature=+crt-static",
   "-C", "link-self-contained=yes",
 ]

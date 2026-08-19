@@ -63,7 +63,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 
 use crate::db::{DB_POOL_SIZE, build_pool, snapshot_ratings};
-use crate::util::{DEFAULT_OMDB_URL, ct_eq, snake_case, snake_case_entry_keys, utcnow};
+use crate::util::{DEFAULT_OMDB_URL, ct_eq, normalize_omdb, utcnow};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/moviedb/movies.db";
 
@@ -287,10 +287,6 @@ where
     }
 }
 
-fn personal_entry(rating: &str) -> Value {
-    json!({ "source": "Personal", "value": rating })
-}
-
 /// `axum::extract::Path<String>`, but a rejection (in practice only
 /// undecodable percent-escapes in the path segment) comes back in this
 /// API's `{"detail": "..."}` shape as a 400 — malformed request syntax —
@@ -312,43 +308,20 @@ where
 }
 
 /// Normalizes a Response=True OMDB payload into the shape it's stored and
-/// served in: every key snake_cased (Map preserves insertion order via the
-/// `preserve_order` feature, so this keeps OMDB's original field order rather
-/// than an arbitrary hash order), `Ratings` folded into `ratings` with each
-/// entry's keys snake_cased and the Personal entry appended, and the
-/// now-redundant `response` field dropped.
+/// served in, via the shared `util::normalize_omdb`. Returns the map on
+/// success, or a 502 `Response` (boxed to satisfy the signature) if OMDB
+/// sent something that isn't a JSON object.
 fn normalize_omdb_movie(movie: Value, rating: &str) -> Result<Map<String, Value>, Box<Response>> {
-    // Consume `movie` (rather than borrow+clone every field) — it's not
-    // read again after this, so moving each value into `out` skips a clone
-    // of every OMDB field (Plot, Actors, Poster, ...) per request.
-    let Value::Object(obj) = movie else {
-        return Err(Box::new(internal_error(
-            "OMDB response was not a JSON object",
-        )));
-    };
-    let mut out = Map::new();
-    for (key, value) in obj {
-        if key == "Ratings" {
-            let mut ratings = match value {
-                Value::Array(a) => snake_case_entry_keys(a),
-                _ => Vec::new(),
-            };
-            ratings.push(personal_entry(rating));
-            out.insert("ratings".to_string(), Value::Array(ratings));
-        } else {
-            out.insert(snake_case(&key), value);
+    match movie {
+        Value::Object(obj) => Ok(normalize_omdb(obj, Value::String(rating.to_string()))),
+        _ => {
+            eprintln!("OMDB response was not a JSON object");
+            Err(Box::new(detail(
+                StatusCode::BAD_GATEWAY,
+                "OMDB response was not a JSON object",
+            )))
         }
     }
-    if !out.contains_key("ratings") {
-        out.insert(
-            "ratings".to_string(),
-            Value::Array(vec![personal_entry(rating)]),
-        );
-    }
-    // shift_remove, not remove: with preserve_order, plain remove is a
-    // swap_remove and would scramble the remaining keys' order.
-    out.shift_remove("response");
-    Ok(out)
 }
 
 /// Upserts one movie plus its `ratings_history` snapshot in a single
@@ -453,10 +426,12 @@ async fn add_movie(State(state): State<Arc<AppState>>, Params(p): Params<AddPara
         let Some(imdbid) = out.get("imdb_id").and_then(Value::as_str).map(String::from) else {
             // OMDB violating its own contract (Response=True without an
             // imdbID) — nothing sensible to persist or serve.
-            return internal_error("OMDB response missing imdbID");
+            eprintln!("OMDB response missing imdbID");
+            return detail(StatusCode::BAD_GATEWAY, "OMDB response missing imdbID");
         };
         let Some(title) = out.get("title").and_then(Value::as_str).map(String::from) else {
-            return internal_error("OMDB response missing Title");
+            eprintln!("OMDB response missing Title");
+            return detail(StatusCode::BAD_GATEWAY, "OMDB response missing Title");
         };
         // Owned, not borrowed: the write below runs on a blocking-pool thread
         // (see with_conn), which needs a 'static closure — a &[Value] into

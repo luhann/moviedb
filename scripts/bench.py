@@ -113,7 +113,7 @@ def seed(args):
             title   TEXT GENERATED ALWAYS AS (json_extract(data, '$.title')) VIRTUAL,
             year    TEXT GENERATED ALWAYS AS (json_extract(data, '$.year'))  VIRTUAL
         )
-    """)  # must match init_db in src/main.rs
+    """)  # must match init_db in src/db.rs
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_movies_title_year ON movies (title, year)")
 

@@ -21,11 +21,19 @@ BIN="target/x86_64-unknown-linux-musl/release/moviedb"
 
 cd "$(dirname "$0")/.."
 
+# A RUSTFLAGS in the environment replaces .cargo/config.toml's rustflags
+# wholesale — including the pinned target-cpu — and this workstation's Gentoo
+# profile exports "-C target-cpu=native". Building the deploy artifact under
+# that gives the Coffee Lake LXC host a Zen 3 binary that SIGILLs on the first
+# AMD-only instruction. Config wins here; interactive builds are unaffected.
+unset RUSTFLAGS
+
 cargo build --release --locked
 file "$BIN" | grep -q 'static-pie linked' || {
     echo "ABORT: $BIN is not static-pie linked — wrong toolchain/config?" >&2
     exit 1
 }
+
 python3 tests/smoke_test.py
 
 # One master connection so password auth prompts exactly once; the scp and

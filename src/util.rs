@@ -2,7 +2,7 @@
 //! (`http.rs`'s server and `refresh.rs`'s refresh job both need these).
 
 use chrono::{SecondsFormat, Utc};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 pub(crate) const DEFAULT_OMDB_URL: &str = "https://www.omdbapi.com/";
 
@@ -34,8 +34,6 @@ pub(crate) fn snake_case(key: &str) -> String {
 
 /// Snake-cases the keys inside each ratings entry ("Source" -> "source",
 /// "Value" -> "value" in practice), leaving non-object entries untouched.
-/// Shared by the two places that fold an OMDB `Ratings` array into a stored
-/// doc (`http::normalize_omdb_movie`, `refresh::rebuild_doc`).
 pub(crate) fn snake_case_entry_keys(entries: Vec<Value>) -> Vec<Value> {
     entries
         .into_iter()
@@ -50,6 +48,40 @@ pub(crate) fn snake_case_entry_keys(entries: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
+/// Normalizes a Response=True OMDB payload into the stored/served shape:
+/// every key snake_cased (Map preserves insertion order via the
+/// `preserve_order` feature, so this keeps OMDB's original field order),
+/// `Ratings` folded into `ratings` with each entry's keys snake_cased and
+/// the Personal entry appended, and the now-redundant `response` field
+/// dropped. The single source of truth for the doc shape — both the server
+/// (`http::add_movie`) and the refresh job (`refresh::refresh_movie`) go
+/// through here, so the two can't drift on what a stored movie looks like.
+pub(crate) fn normalize_omdb(omdb: Map<String, Value>, personal: Value) -> Map<String, Value> {
+    let mut out = Map::new();
+    for (key, value) in omdb {
+        if key == "Ratings" {
+            let mut ratings = match value {
+                Value::Array(a) => snake_case_entry_keys(a),
+                _ => Vec::new(),
+            };
+            ratings.push(json!({ "source": "Personal", "value": personal }));
+            out.insert("ratings".to_string(), Value::Array(ratings));
+        } else {
+            out.insert(snake_case(&key), value);
+        }
+    }
+    if !out.contains_key("ratings") {
+        out.insert(
+            "ratings".to_string(),
+            Value::Array(vec![json!({ "source": "Personal", "value": personal })]),
+        );
+    }
+    // shift_remove, not remove: with preserve_order, plain remove is a
+    // swap_remove and would scramble the remaining keys' order.
+    out.shift_remove("response");
+    out
+}
+
 /// UTC timestamp at millisecond precision with a "+00:00" (not "Z") suffix,
 /// e.g. "2026-07-17T12:34:56.789+00:00". `ratings_history` ordering is
 /// lexical on this string, so the format has to stay byte-identical (fixed
@@ -61,14 +93,17 @@ pub(crate) fn utcnow() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, false)
 }
 
-/// Constant-time byte comparison: if lengths differ fail, else XOR-fold.
+/// Constant-time byte comparison: XOR-folds all bytes up to the shorter
+/// length, then folds the length mismatch into the same diff so the
+/// comparison time depends only on the shorter input — not on whether the
+/// lengths match (which an early return would leak).
 pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
         diff |= x ^ y;
+    }
+    if a.len() != b.len() {
+        diff |= 0xff;
     }
     diff == 0
 }
@@ -130,5 +165,14 @@ mod tests {
         assert!(!ct_eq(b"secret", b"secre1"));
         assert!(!ct_eq(b"secret", b"secrets")); // different length
         assert!(!ct_eq(b"secrets", b"secret")); // different length, swapped
+    }
+
+    #[test]
+    fn ct_eq_folds_length_mismatch_constant_time() {
+        // Shorter-side prefix matches but lengths differ — must still fail,
+        // without returning early on the length check alone.
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(!ct_eq(b"abcd", b"abc"));
+        assert!(!ct_eq(b"abc", b"abc\0"));
     }
 }
