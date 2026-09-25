@@ -661,7 +661,7 @@
       </div>
       <div class="legend">
         <span class="legend-item"><span class="legend-swatch" style="background:var(--accent)"></span>you rated higher</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:var(--diverge-neg)"></span>critics rated higher</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:var(--diverge-neg)"></span>IMDb rated higher</span>
       </div>
       <div id="divergeWrap"></div>
     </div>
@@ -848,8 +848,6 @@
   };
   const SOURCE_ORDER = [SOURCE.PERSONAL, SOURCE.IMDB, SOURCE.RT, SOURCE.MC];
 
-  function cssVar(name) { return getComputedStyle(document.body).getPropertyValue(name).trim(); }
-
   function el(tag, attrs) {
     const n = document.createElementNS(NS, tag);
     for (const k in attrs) n.setAttribute(k, attrs[k]);
@@ -888,17 +886,22 @@
   function truncate(str, maxLen) {
     return str.length > maxLen ? str.slice(0, maxLen - 1).trimEnd() + "…" : str;
   }
+  const mean = (vals) => vals.reduce((a, b) => a + b, 0) / vals.length;
+  const plural = (n) => n + " title" + (n === 1 ? "" : "s");
   function parseNumber(raw) {
     if (raw == null || raw === "N/A") return null;
     const n = parseFloat(raw);
     return Number.isFinite(n) ? n : null;
   }
-  // Every source normalized to a common /100 score. Personal ratings are
+  // One raw rating value on a common /100 scale. Personal ratings are
   // always entered out of 100; IMDb is the only source needing rescale.
-  function normalizedRating(ratings, source) {
-    const n = parseNumber(ratingBySource(ratings, source));
+  function scoreFor(source, raw) {
+    const n = parseNumber(raw);
     if (n === null) return null;
     return source === SOURCE.IMDB ? n * 10 : n;
+  }
+  function normalizedRating(ratings, source) {
+    return scoreFor(source, ratingBySource(ratings, source));
   }
   function primaryGenre(movie) {
     if (!movie.genre || movie.genre === "N/A") return null;
@@ -939,8 +942,7 @@
   // eyeball 179 overlapping dots for a trend that may not be there.
   function pearsonR(xs, ys) {
     const n = xs.length;
-    const meanX = xs.reduce((a, b) => a + b, 0) / n;
-    const meanY = ys.reduce((a, b) => a + b, 0) / n;
+    const meanX = mean(xs), meanY = mean(ys);
     let cov = 0, varX = 0, varY = 0;
     for (let i = 0; i < n; i++) {
       const dx = xs[i] - meanX, dy = ys[i] - meanY;
@@ -950,8 +952,7 @@
   }
   function linearFit(xs, ys) {
     const n = xs.length;
-    const meanX = xs.reduce((a, b) => a + b, 0) / n;
-    const meanY = ys.reduce((a, b) => a + b, 0) / n;
+    const meanX = mean(xs), meanY = mean(ys);
     let num = 0, den = 0;
     for (let i = 0; i < n; i++) {
       num += (xs[i] - meanX) * (ys[i] - meanY);
@@ -1002,28 +1003,26 @@
   }
   function hideKeyPrompt() { overlay.hidden = true; }
 
-  async function apiFetch(path) {
-    const res = await fetch(path, { headers: { "x-api-key": getKey() } });
+  async function apiRequest(path, init) {
+    const res = await fetch(path, { ...init, headers: { "x-api-key": getKey() } });
     if (res.status === 401) {
       localStorage.removeItem(KEY_STORAGE);
       showKeyPrompt("That key was rejected — try again.");
       throw new Error("unauthorized");
     }
+    return res;
+  }
+
+  async function apiFetch(path) {
+    const res = await apiRequest(path);
     if (!res.ok) throw new Error("request to " + path + " failed: " + res.status);
     return res.json();
   }
 
-  // Unlike apiFetch, callers here need the real server error (title not
-  // found, OMDb quota exhausted, ...) to show the user, not just a generic
-  // failure — so this reports status/body back instead of throwing on a
-  // non-401 error.
+  // Callers here show the server's own error (title not found, OMDb quota
+  // exhausted, ...), so a non-401 failure is reported back, not thrown.
   async function apiPost(path) {
-    const res = await fetch(path, { method: "POST", headers: { "x-api-key": getKey() } });
-    if (res.status === 401) {
-      localStorage.removeItem(KEY_STORAGE);
-      showKeyPrompt("That key was rejected — try again.");
-      throw new Error("unauthorized");
-    }
+    const res = await apiRequest(path, { method: "POST" });
     let body = null;
     try { body = await res.json(); } catch (e) { /* no/invalid JSON body */ }
     return { ok: res.ok, status: res.status, body };
@@ -1129,7 +1128,7 @@
       .map((m) => normalizedRating(m.ratings, SOURCE.PERSONAL))
       .filter((v) => v !== null);
     document.getElementById("statAvgPersonal").innerHTML = personalVals.length
-      ? (personalVals.reduce((a, b) => a + b, 0) / personalVals.length).toFixed(0) + "<small>/100</small>"
+      ? mean(personalVals).toFixed(0) + "<small>/100</small>"
       : "—";
 
     const deltas = movies
@@ -1141,7 +1140,7 @@
       .filter((v) => v !== null);
     const avgDeltaEl = document.getElementById("statAvgDelta");
     if (deltas.length) {
-      const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length;
+      const avg = mean(deltas);
       avgDeltaEl.textContent = fmtDelta(avg);
       avgDeltaEl.style.color = avg >= 0 ? "var(--good)" : "var(--critical)";
       document.getElementById("statAvgDeltaSub").textContent =
@@ -1262,7 +1261,7 @@
       const val = el("text", { class: "bar-label", x: labelW + w + 8, y: cy + 4 });
       val.textContent = d.n;
       svg.appendChild(val);
-      wire(bar, `<b>${escapeHtml(d.label)}</b><br>${d.n} title${d.n === 1 ? "" : "s"}`);
+      wire(bar, `<b>${escapeHtml(d.label)}</b><br>${plural(d.n)}`);
     });
   }
 
@@ -1325,7 +1324,7 @@
       "Average personal score by MPAA rating (0–100 scale, same axis every row).";
     order.forEach((bucket, i) => {
       const vals = buckets[bucket];
-      const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const avg = mean(vals);
       const y = top + i * rowH, cy = y + rowH / 2;
       const label = el("text", { class: "row-label", x: labelW - 10, y: cy + 4, "text-anchor": "end" });
       label.textContent = bucket;
@@ -1336,7 +1335,7 @@
       const val = el("text", { class: "bar-label", x: labelW + w + 8, y: cy + 4 });
       val.textContent = avg.toFixed(0);
       svg.appendChild(val);
-      wire(bar, `<b>${escapeHtml(bucket)}</b><br>avg ${avg.toFixed(0)}/100 · ${vals.length} title${vals.length === 1 ? "" : "s"}`);
+      wire(bar, `<b>${escapeHtml(bucket)}</b><br>avg ${avg.toFixed(0)}/100 · ${plural(vals.length)}`);
     });
   }
 
@@ -1347,228 +1346,194 @@
     return mag < 0.1 ? `r = ${r.toFixed(2)} — ${strength}.` : `r = ${r.toFixed(2)} — ${strength} ${sign} relationship.`;
   }
 
+  // Scatter with a dashed least-squares line and the Pearson r folded into
+  // the panel's note. The y axis always starts at 0; x is fitted to the data.
+  function renderScatter(wrapId, opts) {
+    const wrap = document.getElementById(wrapId);
+    const note = document.getElementById(opts.noteId);
+    const { width, height, left, right, points } = opts;
+    wrap.innerHTML = `<svg class="chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${opts.ariaLabel}"></svg>`;
+    const svg = wrap.firstChild;
+    if (points.length < 2) {
+      emptyState(wrap, opts.emptyMsg);
+      note.textContent = opts.question;
+      return;
+    }
+    const xs = points.map((p) => p.x), ys = points.map((p) => p.y);
+    note.textContent = opts.question + " " + describeR(pearsonR(xs, ys));
+
+    const top = 10, bottom = 30;
+    const w = width - left - right, h = height - top - bottom;
+    const { xMin, xMax, xStep, xFmt, yMax, yTicks, yFmt } = opts.axes(xs, ys);
+    const xSpan = xMax - xMin || 1;
+    const x = (v) => left + ((v - xMin) / xSpan) * w;
+    const y = (v) => top + h - (v / yMax) * h;
+
+    yTicks.forEach((v) => {
+      svg.appendChild(el("line", { x1: left, x2: left + w, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
+      const t = el("text", { class: "axis-tick", x: left - 8, y: y(v) + 3, "text-anchor": "end" });
+      t.textContent = yFmt(v);
+      svg.appendChild(t);
+    });
+    for (let v = xMin; v <= xMax; v += xStep) {
+      const t = el("text", { class: "axis-tick", x: x(v), y: top + h + 18, "text-anchor": "middle" });
+      t.textContent = xFmt(v);
+      svg.appendChild(t);
+    }
+
+    const fit = linearFit(xs, ys);
+    const clampY = (v) => Math.max(0, Math.min(yMax, v));
+    svg.appendChild(el("line", {
+      x1: x(xMin), x2: x(xMax),
+      y1: y(clampY(fit.slope * xMin + fit.intercept)), y2: y(clampY(fit.slope * xMax + fit.intercept)),
+      stroke: "var(--ink-muted)", "stroke-width": 1.5, "stroke-dasharray": "4,3",
+    }));
+
+    points.forEach((p) => {
+      const c = el("circle", {
+        cx: x(p.x), cy: y(p.y), r: 3.5, fill: "var(--accent)", "fill-opacity": 0.55,
+        stroke: "var(--surface)", "stroke-width": 0.5, class: "hit",
+      });
+      svg.appendChild(c);
+      wire(c, p.tip);
+    });
+  }
+
   function renderRuntimeScatter(movies) {
-    const wrap = document.getElementById("runtimeWrap");
-    wrap.innerHTML = '<svg class="chart" id="runtimeChart" viewBox="0 0 560 260" role="img" aria-label="Scatter plot of personal rating against runtime"></svg>';
-    const svg = document.getElementById("runtimeChart");
     const points = movies
       .map((m) => {
         const runtime = parseRuntime(m);
         const rating = normalizedRating(m.ratings, SOURCE.PERSONAL);
-        return runtime !== null && rating !== null ? { title: m.title, runtime, rating } : null;
+        if (runtime === null || rating === null) return null;
+        return { x: runtime, y: rating, tip: `<b>${escapeHtml(m.title)}</b><br>${runtime} min · ${rating.toFixed(0)}/100` };
       })
       .filter((p) => p !== null);
-    if (points.length < 2) {
-      emptyState(wrap, "Not enough runtime + personal-score data yet.");
-      document.getElementById("runtimeNote").textContent = "Does a longer runtime earn a higher score?";
-      return;
-    }
-    const r = pearsonR(points.map((p) => p.runtime), points.map((p) => p.rating));
-    document.getElementById("runtimeNote").textContent = "Does a longer runtime earn a higher score? " + describeR(r);
-
-    const left = 40, right = 12, top = 10, bottom = 30;
-    const w = 560 - left - right, h = 260 - top - bottom;
-    const runtimes = points.map((p) => p.runtime);
-    const rMin = Math.floor(Math.min(...runtimes) / 10) * 10;
-    const rMax = Math.ceil(Math.max(...runtimes) / 10) * 10;
-    const x = (v) => left + ((v - rMin) / (rMax - rMin)) * w;
-    const y = (v) => top + h - (v / 100) * h;
-
-    [0, 25, 50, 75, 100].forEach((v) => {
-      svg.appendChild(el("line", { x1: left, x2: left + w, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
-      const t = el("text", { class: "axis-tick", x: left - 8, y: y(v) + 3, "text-anchor": "end" });
-      t.textContent = v;
-      svg.appendChild(t);
-    });
-    const step = Math.ceil((rMax - rMin) / 5 / 30) * 30 || 30;
-    for (let v = rMin; v <= rMax; v += step) {
-      const t = el("text", { class: "axis-tick", x: x(v), y: top + h + 18, "text-anchor": "middle" });
-      t.textContent = v + "m";
-      svg.appendChild(t);
-    }
-
-    const fit = linearFit(runtimes, points.map((p) => p.rating));
-    const y1 = Math.max(0, Math.min(100, fit.slope * rMin + fit.intercept));
-    const y2 = Math.max(0, Math.min(100, fit.slope * rMax + fit.intercept));
-    svg.appendChild(el("line", {
-      x1: x(rMin), x2: x(rMax), y1: y(y1), y2: y(y2),
-      stroke: "var(--ink-muted)", "stroke-width": 1.5, "stroke-dasharray": "4,3",
-    }));
-
-    points.forEach((p) => {
-      const c = el("circle", {
-        cx: x(p.runtime), cy: y(p.rating), r: 3.5, fill: "var(--accent)", "fill-opacity": 0.55,
-        stroke: "var(--surface)", "stroke-width": 0.5, class: "hit",
-      });
-      svg.appendChild(c);
-      wire(c, `<b>${escapeHtml(p.title)}</b><br>${p.runtime} min · ${p.rating.toFixed(0)}/100`);
+    renderScatter("runtimeWrap", {
+      width: 560, height: 260, left: 40, right: 12, points,
+      noteId: "runtimeNote",
+      question: "Does a longer runtime earn a higher score?",
+      ariaLabel: "Scatter plot of personal rating against runtime",
+      emptyMsg: "Not enough runtime + personal-score data yet.",
+      axes: (xs) => {
+        const xMin = Math.floor(Math.min(...xs) / 10) * 10;
+        const xMax = Math.ceil(Math.max(...xs) / 10) * 10;
+        return {
+          xMin, xMax, xStep: Math.ceil((xMax - xMin) / 5 / 30) * 30 || 30, xFmt: (v) => v + "m",
+          yMax: 100, yTicks: [0, 25, 50, 75, 100], yFmt: (v) => v,
+        };
+      },
     });
   }
 
   function renderYearRuntimeScatter(movies) {
-    const wrap = document.getElementById("yearRuntimeWrap");
-    wrap.innerHTML = '<svg class="chart" id="yearRuntimeChart" viewBox="0 0 1000 260" role="img" aria-label="Scatter plot of runtime against release year"></svg>';
-    const svg = document.getElementById("yearRuntimeChart");
     const points = movies
       .map((m) => {
         const year = releaseYear(m);
         const runtime = parseRuntime(m);
-        return year !== null && runtime !== null ? { title: m.title, year, runtime } : null;
+        if (year === null || runtime === null) return null;
+        return { x: year, y: runtime, tip: `<b>${escapeHtml(m.title)}</b><br>${year} · ${runtime} min` };
       })
       .filter((p) => p !== null);
-    if (points.length < 2) {
-      emptyState(wrap, "Not enough release-year + runtime data yet.");
-      document.getElementById("yearRuntimeNote").textContent = "Has runtime crept up over the decades?";
-      return;
-    }
-    const r = pearsonR(points.map((p) => p.year), points.map((p) => p.runtime));
-    document.getElementById("yearRuntimeNote").textContent = "Has runtime crept up over the decades? " + describeR(r);
-
-    const left = 44, right = 16, top = 10, bottom = 30;
-    const w = 1000 - left - right, h = 260 - top - bottom;
-    const years = points.map((p) => p.year);
-    const runtimes = points.map((p) => p.runtime);
-    const xMin = Math.floor(Math.min(...years) / 5) * 5;
-    const xMax = Math.ceil(Math.max(...years) / 5) * 5;
-    // Runtime is a ratio scale (0 means something) — unlike the year axis,
-    // starting it anywhere but 0 would exaggerate how much runtime actually
-    // varies across the collection.
-    const yMax = Math.ceil(Math.max(...runtimes) / 10) * 10;
-    const x = (v) => left + ((v - xMin) / (xMax - xMin)) * w;
-    const y = (v) => top + h - (v / yMax) * h;
-
-    const yStep = Math.ceil(yMax / 5 / 30) * 30 || 30;
-    for (let v = 0; v <= yMax; v += yStep) {
-      svg.appendChild(el("line", { x1: left, x2: left + w, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
-      const t = el("text", { class: "axis-tick", x: left - 8, y: y(v) + 3, "text-anchor": "end" });
-      t.textContent = v + "m";
-      svg.appendChild(t);
-    }
-    const xStep = Math.ceil((xMax - xMin) / 8 / 5) * 5 || 5;
-    for (let v = xMin; v <= xMax; v += xStep) {
-      const t = el("text", { class: "axis-tick", x: x(v), y: top + h + 18, "text-anchor": "middle" });
-      t.textContent = v;
-      svg.appendChild(t);
-    }
-
-    const fit = linearFit(years, runtimes);
-    const y1 = Math.max(0, Math.min(yMax, fit.slope * xMin + fit.intercept));
-    const y2 = Math.max(0, Math.min(yMax, fit.slope * xMax + fit.intercept));
-    svg.appendChild(el("line", {
-      x1: x(xMin), x2: x(xMax), y1: y(y1), y2: y(y2),
-      stroke: "var(--ink-muted)", "stroke-width": 1.5, "stroke-dasharray": "4,3",
-    }));
-
-    points.forEach((p) => {
-      const c = el("circle", {
-        cx: x(p.year), cy: y(p.runtime), r: 3.5, fill: "var(--accent)", "fill-opacity": 0.55,
-        stroke: "var(--surface)", "stroke-width": 0.5, class: "hit",
-      });
-      svg.appendChild(c);
-      wire(c, `<b>${escapeHtml(p.title)}</b><br>${p.year} · ${p.runtime} min`);
+    renderScatter("yearRuntimeWrap", {
+      width: 1000, height: 260, left: 44, right: 16, points,
+      noteId: "yearRuntimeNote",
+      question: "Has runtime crept up over the decades?",
+      ariaLabel: "Scatter plot of runtime against release year",
+      emptyMsg: "Not enough release-year + runtime data yet.",
+      axes: (xs, ys) => {
+        const xMin = Math.floor(Math.min(...xs) / 5) * 5;
+        const xMax = Math.ceil(Math.max(...xs) / 5) * 5;
+        // Runtime is a ratio scale (0 means something): starting the axis
+        // anywhere else would exaggerate how much runtime varies.
+        const yMax = Math.ceil(Math.max(...ys) / 10) * 10;
+        const yStep = Math.ceil(yMax / 5 / 30) * 30 || 30;
+        const yTicks = [];
+        for (let v = 0; v <= yMax; v += yStep) yTicks.push(v);
+        return {
+          xMin, xMax, xStep: Math.ceil((xMax - xMin) / 8 / 5) * 5 || 5, xFmt: (v) => v,
+          yMax, yTicks, yFmt: (v) => v + "m",
+        };
+      },
     });
   }
 
-  function renderBoxOffice(movies) {
-    const wrap = document.getElementById("boxOfficeWrap");
-    wrap.innerHTML = '<svg class="chart" id="boxOfficeChart" viewBox="0 0 560 220" role="img" aria-label="Bar chart of average box office by release decade"></svg>';
-    const svg = document.getElementById("boxOfficeChart");
-    const byDecade = {};
-    movies.forEach((m) => {
-      const bo = parseBoxOffice(m);
-      const y = releaseYear(m);
-      if (bo === null || y === null) return;
-      const d = Math.floor(y / 10) * 10;
-      (byDecade[d] = byDecade[d] || []).push(bo);
-    });
-    const present = Object.keys(byDecade).map(Number).sort((a, b) => a - b);
+  const decadeOf = (year) => Math.floor(year / 10) * 10;
+  const decadeLabel = (d) => "'" + String(d).slice(-2) + "s";
+
+  // One column per decade from the first to the last present, empty ones
+  // included: equal-width columns on a time axis imply equal steps, so a gap
+  // (an '80s title, then nothing until the 2010s) has to show as a gap.
+  // `groups` maps decade -> the values that fell in it.
+  function renderDecadeColumns(wrapId, groups, opts) {
+    const wrap = document.getElementById(wrapId);
+    wrap.innerHTML = `<svg class="chart" viewBox="0 0 560 220" role="img" aria-label="${opts.ariaLabel}"></svg>`;
+    const svg = wrap.firstChild;
+    const present = Object.keys(groups).map(Number).sort((a, b) => a - b);
     if (!present.length) {
-      emptyState(wrap, "No box-office data yet.");
+      emptyState(wrap, opts.emptyMsg);
       return;
     }
     const decades = [];
     for (let d = present[0]; d <= present[present.length - 1]; d += 10) decades.push(d);
-    const left = 24, right = 12, top = 16, bottom = 46;
-    const w = 560 - left - right, plotH = 130;
-    const avgs = present.map((d) => byDecade[d].reduce((a, b) => a + b, 0) / byDecade[d].length);
-    const max = Math.max(...avgs);
+    const left = 24, top = 16, plotH = 130;
+    const w = 560 - left - 12;
+    const max = Math.max(...present.map((d) => opts.value(groups[d])));
     const colW = w / decades.length, barW = colW * 0.5;
+    const axisY = top + plotH + 16;
     decades.forEach((d, i) => {
-      const vals = byDecade[d];
-      const avg = vals ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+      const vals = groups[d];
+      const v = vals ? opts.value(vals) : 0;
       const cx = left + colW * i + colW / 2;
-      const barH = max ? (avg / max) * plotH : 0;
-      const bar = el("rect", { x: cx - barW / 2, y: top + plotH - barH, width: barW, height: Math.max(barH, vals ? 2 : 0), rx: 3, fill: "var(--accent)", class: "hit" });
+      const barH = max ? (v / max) * plotH : 0;
+      const bar = el("rect", { x: cx - barW / 2, y: top + plotH - barH, width: barW, height: vals ? Math.max(barH, 2) : 0, rx: 3, fill: "var(--accent)", class: "hit" });
       svg.appendChild(bar);
       if (vals) {
         const val = el("text", { class: "bar-label", x: cx, y: top + plotH - barH - 6, "text-anchor": "middle" });
-        val.textContent = fmtMoney(avg);
+        val.textContent = opts.format(v);
         svg.appendChild(val);
       }
-      wire(bar, vals
-        ? `<b>'${String(d).slice(-2)}s</b><br>avg ${fmtMoney(avg)} · ${vals.length} title${vals.length === 1 ? "" : "s"}`
-        : `<b>'${String(d).slice(-2)}s</b><br>no box-office data`);
+      wire(bar, `<b>${decadeLabel(d)}</b><br>${opts.tip(vals, v)}`);
 
-      const holeY = top + plotH + 16;
-      svg.appendChild(el("circle", { cx, cy: holeY, r: 4, fill: "none", stroke: "var(--baseline)", "stroke-width": 1.5 }));
-      const lab = el("text", { class: "axis-tick", x: cx, y: holeY + 26, "text-anchor": "middle" });
-      lab.textContent = "'" + String(d).slice(-2) + "s";
+      svg.appendChild(el("circle", { cx, cy: axisY, r: 4, fill: "none", stroke: "var(--baseline)", "stroke-width": 1.5 }));
+      const lab = el("text", { class: "axis-tick", x: cx, y: axisY + 26, "text-anchor": "middle" });
+      lab.textContent = decadeLabel(d);
       svg.appendChild(lab);
     });
     svg.appendChild(el("line", {
-      x1: left, x2: left + w, y1: top + plotH + 16, y2: top + plotH + 16,
+      x1: left, x2: left + w, y1: axisY, y2: axisY,
       stroke: "var(--baseline)", "stroke-width": 1, "stroke-dasharray": "1,5",
     }));
   }
 
+  function renderBoxOffice(movies) {
+    const groups = {};
+    movies.forEach((m) => {
+      const bo = parseBoxOffice(m);
+      const y = releaseYear(m);
+      if (bo !== null && y !== null) (groups[decadeOf(y)] = groups[decadeOf(y)] || []).push(bo);
+    });
+    renderDecadeColumns("boxOfficeWrap", groups, {
+      ariaLabel: "Bar chart of average box office by release decade",
+      emptyMsg: "No box-office data yet.",
+      value: mean,
+      format: fmtMoney,
+      tip: (vals, avg) => (vals ? `avg ${fmtMoney(avg)} · ${plural(vals.length)}` : "no box-office data"),
+    });
+  }
+
   function renderDecade(movies) {
-    const counts = {};
+    const groups = {};
     movies.forEach((m) => {
       const y = releaseYear(m);
-      if (y === null) return;
-      const d = Math.floor(y / 10) * 10;
-      counts[d] = (counts[d] || 0) + 1;
+      if (y !== null) (groups[decadeOf(y)] = groups[decadeOf(y)] || []).push(y);
     });
-    const presentDecades = Object.keys(counts).map(Number).sort((a, b) => a - b);
-    const wrap = document.getElementById("decadeWrap");
-    wrap.innerHTML = '<svg class="chart" id="decadeChart" viewBox="0 0 560 220" role="img" aria-label="Bar chart of title counts by release decade"></svg>';
-    const svg = document.getElementById("decadeChart");
-    if (!presentDecades.length) {
-      emptyState(wrap, "No release-year data yet.");
-      return;
-    }
-    // Equal-width bars on a time axis imply equal time steps — a collection
-    // with an 1980s title and nothing again until the 2010s would otherwise
-    // render three adjacent bars as if those decades were consecutive.
-    const decades = [];
-    for (let d = presentDecades[0]; d <= presentDecades[presentDecades.length - 1]; d += 10) decades.push(d);
-    const left = 24, right = 12, top = 10, bottom = 46;
-    const w = 560 - left - right, plotH = 130;
-    const max = Math.max(...presentDecades.map((d) => counts[d]));
-    const colW = w / decades.length, barW = colW * 0.5;
-    decades.forEach((d, i) => {
-      const n = counts[d] || 0;
-      const cx = left + colW * i + colW / 2;
-      const barH = (n / max) * plotH;
-      const bar = el("rect", { x: cx - barW / 2, y: top + plotH - barH, width: barW, height: Math.max(barH, n ? 2 : 0), rx: 3, fill: "var(--accent)", class: "hit" });
-      svg.appendChild(bar);
-      if (n) {
-        const val = el("text", { class: "bar-label", x: cx, y: top + plotH - barH - 6, "text-anchor": "middle" });
-        val.textContent = n;
-        svg.appendChild(val);
-      }
-      wire(bar, `<b>'${String(d).slice(-2)}s</b><br>${n} title${n === 1 ? "" : "s"}`);
-
-      const holeY = top + plotH + 16;
-      svg.appendChild(el("circle", { cx, cy: holeY, r: 4, fill: "none", stroke: "var(--baseline)", "stroke-width": 1.5 }));
-      const lab = el("text", { class: "axis-tick", x: cx, y: holeY + 26, "text-anchor": "middle" });
-      lab.textContent = "'" + String(d).slice(-2) + "s";
-      svg.appendChild(lab);
+    renderDecadeColumns("decadeWrap", groups, {
+      ariaLabel: "Bar chart of title counts by release decade",
+      emptyMsg: "No release-year data yet.",
+      value: (vals) => vals.length,
+      format: (n) => n,
+      tip: (vals) => plural(vals ? vals.length : 0),
     });
-    svg.appendChild(el("line", {
-      x1: left, x2: left + w, y1: top + plotH + 16, y2: top + plotH + 16,
-      stroke: "var(--baseline)", "stroke-width": 1, "stroke-dasharray": "1,5",
-    }));
   }
 
   /* ---------------- recently catalogued ---------------- */
@@ -1665,15 +1630,12 @@
       facts.push(["Δ vs IMDb", `<span class="${d >= 0 ? "delta-up" : "delta-down"}">${fmtDelta(d)}</span>`]);
     }
 
-    // Only the refresh job stamps `_refreshed`; POST doesn't. A title
-    // catalogued and never refreshed since therefore has no date to show —
-    // name the missing field rather than say "never refreshed", which would
-    // contradict the ledger's Refreshed column (that one is derived from
-    // ratings_history, which POST does write).
+    // POST and refresh both stamp `_refreshed`; only a row from before
+    // POST did lacks it.
     const refreshed = presentField(movie._refreshed);
     facts.push(["Last refresh", refreshed
       ? escapeHtml(fmtDate(refreshed)) + (isStale(refreshed) ? ' <span class="chip stale">stale</span>' : "")
-      : '<span class="chip">no _refreshed stamp</span>']);
+      : "—"]);
 
     const imdbId = presentField(movie.imdb_id);
     if (imdbId) {
@@ -1888,7 +1850,7 @@
     snapshots.forEach((s) => {
       if (!SOURCE_LABEL[s.source]) return; // ignore unknown/future source names
       const t = new Date(s.observed).getTime();
-      const v = s.source === SOURCE.IMDB ? parseNumber(s.value) * 10 : parseNumber(s.value);
+      const v = scoreFor(s.source, s.value);
       if (!Number.isFinite(t) || v === null) return;
       (bySource[s.source] = bySource[s.source] || []).push({ t, v });
     });
