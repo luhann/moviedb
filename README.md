@@ -93,6 +93,40 @@ systemctl enable --now moviedb moviedb-refresh.timer
 systemctl status moviedb
 systemd-analyze security moviedb   # exposure score; expect ~1.x
 ```
+## Dashboard
+
+`web/dashboard.html` is a single-file dashboard over the same API, served as a
+static file — nothing builds or bundles it. `scripts/deploy.sh` ships it with
+the binary: the page and `web/fonts/` go to the web root after the API
+restarts, so a failed binary deploy leaves the old page in place. It carries
+the
+[patroclus](https://github.com/luhann/patroclus) screen theme: the token block
+at the top of the file is the one my other sites carry, plus the two values
+they have no use for (the meta accent and the shadow), so it can be diffed
+against patroclus's `design.yaml`. Dark is the default, light is
+opt-in through the toggle in the masthead, and the choice is remembered in this
+browser under `theme_pref_v2`. The three faces are self-hosted from `web/fonts/`
+rather than pulled from a CDN, so **`fonts/` has to be pushed alongside the
+page** or the type silently falls back.
+
+Mine sits behind a Caddy `file_server`, whose root and port the deploy script
+has to be told about if they aren't the defaults — set `WEB_ROOT=` and
+`WEB_PORT=` alongside `PVE_HOST=`/`VMID=`. The page is pushed under the name
+that root serves as its index. After pushing, the script checks the page's
+checksum on the container and then asks Caddy for the page and for one of the
+fonts, so a font that never landed fails the deploy rather than showing up as
+type that has quietly fallen back.
+
+If pushing manually:
+
+```bash
+pct exec 401 -- mkdir -p /opt/moviedb/web/fonts   # pct push won't create it
+pct push 401 web/dashboard.html /opt/moviedb/web/index.html --perms 0644
+for f in web/fonts/*.woff2; do
+    pct push 401 "$f" "/opt/moviedb/web/fonts/$(basename "$f")" --perms 0644
+done
+```
+
 ## Routing
 
 Up to you. I use [traefik](https://github.com/traefik/traefik) as my reverse proxy, but any way you request from the API will work.
