@@ -41,7 +41,6 @@ use std::process::exit;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
 use axum::extract::{FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -49,11 +48,9 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use bytes::Bytes;
-use futures_util::stream;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Rows, TransactionBehavior, params};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -123,47 +120,46 @@ fn raw_json(body: String) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
-/// Streams rows that are each already a complete JSON object as one JSON
-/// array. Same reasoning as `raw_json`: the bytes came out of a `data` column
-/// we wrote, so they go out as array elements without ever becoming a `Value`
-/// tree, and without being concatenated into one contiguous buffer first.
-fn json_array_response(rows: Vec<String>) -> Response {
-    let n = rows.len();
-    let chunks = std::iter::once(Bytes::from_static(b"["))
-        .chain(rows.into_iter().enumerate().map(move |(i, doc)| {
-            let mut buf = doc.into_bytes();
-            if i + 1 < n {
-                buf.push(b',');
-            }
-            Bytes::from(buf)
-        }))
-        .chain(std::iter::once(Bytes::from_static(b"]")))
-        .map(Ok::<_, std::convert::Infallible>);
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        Body::from_stream(stream::iter(chunks)),
-    )
-        .into_response()
+/// Joins rows that each hold a complete JSON document into one JSON array,
+/// copying each row's bytes straight out of SQLite: the docs never become
+/// `Value` trees or per-row `String`s. One buffer, so the response goes out
+/// with a `Content-Length` rather than chunked.
+fn collect_json_array(
+    mut rows: Rows<'_>,
+    mut push_doc: impl FnMut(&mut String, &Row<'_>) -> rusqlite::Result<()>,
+) -> rusqlite::Result<String> {
+    let mut body = String::from("[");
+    while let Some(row) = rows.next()? {
+        if body.len() > 1 {
+            body.push(',');
+        }
+        push_doc(&mut body, row)?;
+    }
+    body.push(']');
+    Ok(body)
 }
 
-/// Appends one string-valued member to a stored movie doc without parsing it,
-/// preserving `raw_json`'s zero-round-trip property for responses that need to
-/// add a field. Leans on the same invariant: a `data` column always holds a
-/// non-empty JSON object this server serialized, so it ends in `}` and already
-/// has a member to comma-separate from. Anything else (a hand-edited row) is
-/// returned untouched rather than spliced into invalid JSON. Callers pass
-/// their own fixed-format ASCII timestamps, which need no escaping.
-fn splice_member(mut doc: String, key: &str, value: &str) -> String {
-    if doc.len() < 3 || !doc.ends_with('}') {
-        return doc;
-    }
-    doc.truncate(doc.len() - 1);
-    doc.push_str(",\"");
-    doc.push_str(key);
-    doc.push_str("\":\"");
-    doc.push_str(value);
-    doc.push_str("\"}");
-    doc
+fn doc_column<'r>(row: &'r Row<'_>, idx: usize) -> rusqlite::Result<&'r str> {
+    Ok(row.get_ref(idx)?.as_str()?)
+}
+
+/// Appends `doc` to `body` with one extra string member, without parsing it.
+/// Leans on a `data` column always holding a non-empty JSON object this
+/// server serialized, so it ends in `}` and already has a member to
+/// comma-separate from; anything else (a hand-edited row) is appended
+/// untouched rather than spliced into invalid JSON. `value` is written
+/// unescaped — callers pass fixed-format ASCII timestamps.
+fn push_with_member(body: &mut String, doc: &str, key: &str, value: &str) {
+    let Some(without_close) = doc.strip_suffix('}').filter(|d| d.len() >= 2) else {
+        body.push_str(doc);
+        return;
+    };
+    body.push_str(without_close);
+    body.push_str(",\"");
+    body.push_str(key);
+    body.push_str("\":\"");
+    body.push_str(value);
+    body.push_str("\"}");
 }
 
 /// Runs `f` against a pooled connection on a blocking-pool thread. Both pool
@@ -470,18 +466,16 @@ async fn list_movies(
                 vec![t, y],
             ),
         };
-        let result = (|| -> rusqlite::Result<Vec<String>> {
-            // prepare_cached, not prepare: pooled connections are long-lived,
-            // so SQLite parses and plans each of the four literal SQL variants
-            // once per connection instead of once per request.
+        let result = (|| -> rusqlite::Result<String> {
             let mut stmt = conn.prepare_cached(sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(filters), |r| {
-                r.get::<_, String>(0)
-            })?;
-            rows.collect()
+            let rows = stmt.query(rusqlite::params_from_iter(filters))?;
+            collect_json_array(rows, |body, row| {
+                body.push_str(doc_column(row, 0)?);
+                Ok(())
+            })
         })();
         match result {
-            Ok(raw) => json_array_response(raw),
+            Ok(body) => raw_json(body),
             Err(e) => internal_error(format!("failed to list movies: {e}")),
         }
     })
@@ -489,27 +483,18 @@ async fn list_movies(
 }
 
 /// The dashboard's "recently catalogued" view: the N movies with the most
-/// recent `ratings_history` snapshot, newest first. Each doc needs its
-/// `last_refreshed` timestamp folded in, which `splice_member` does textually
-/// — so this keeps `list_movies`' zero-parse property instead of round-tripping
-/// every doc through a `Value` tree just to add one field.
-///
-/// Still buffered into one body rather than streamed like `list_movies`, and
-/// that is load-bearing rather than an oversight: this endpoint is
-/// `LIMIT`-bounded to `MAX_RECENT_LIMIT`, so one write with a `Content-Length`
-/// beats a chunked response whose framing overhead, on a body this small,
-/// costs more than the parse the splice already saved. Measured — streaming it
-/// was 14-18% *slower* than the version this replaced.
+/// recent `ratings_history` snapshot, newest first, each with that
+/// timestamp folded in as `last_refreshed` (textually, see
+/// `push_with_member`).
 async fn get_recent(
     State(state): State<Arc<AppState>>,
     Params(p): Params<RecentParams>,
 ) -> Response {
     let limit = p
         .limit
-        .unwrap_or(DEFAULT_RECENT_LIMIT)
-        .min(MAX_RECENT_LIMIT);
+        .map_or(DEFAULT_RECENT_LIMIT, |n| n.min(MAX_RECENT_LIMIT));
     with_conn(&state, move |conn| {
-        let result = (|| -> rusqlite::Result<Vec<(String, String)>> {
+        let result = (|| -> rusqlite::Result<String> {
             // Correlated MAX, not GROUP BY: the grouped form aggregates
             // every ratings_history row before LIMIT discards all but N, so
             // it costs more on every refresh run forever. `observed` is the
@@ -533,27 +518,19 @@ async fn get_recent(
                 LIMIT ?
                 ",
             )?;
-            let rows = stmt.query_map(params![limit as i64], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            rows.collect()
+            let rows = stmt.query(params![limit as i64])?;
+            collect_json_array(rows, |body, row| {
+                push_with_member(
+                    body,
+                    doc_column(row, 0)?,
+                    "last_refreshed",
+                    doc_column(row, 1)?,
+                );
+                Ok(())
+            })
         })();
         match result {
-            Ok(raw) => {
-                // `last_refreshed` plus its quoting and separator adds a fixed
-                // ~50 bytes per doc; sizing up front keeps this to one alloc.
-                let mut body =
-                    String::with_capacity(raw.iter().map(|(d, _)| d.len() + 50).sum::<usize>() + 2);
-                body.push('[');
-                for (i, (data, last_refreshed)) in raw.into_iter().enumerate() {
-                    if i > 0 {
-                        body.push(',');
-                    }
-                    body.push_str(&splice_member(data, "last_refreshed", &last_refreshed));
-                }
-                body.push(']');
-                raw_json(body)
-            }
+            Ok(body) => raw_json(body),
             Err(e) => internal_error(format!("failed to list recent movies: {e}")),
         }
     })
@@ -699,13 +676,9 @@ pub(crate) async fn serve(host: String, port: u16) {
             exit(1);
         }
     };
-    // axum::serve doesn't set TCP_NODELAY on accepted sockets. GET /movies'
-    // chunked body (no Content-Length, since the row count isn't known until
-    // the query runs) writes headers and the first chunk as separate TCP
-    // segments; without NODELAY that hits the classic Nagle/delayed-ACK
-    // stall — a flat ~35ms tax on every uncontended list, confirmed by
-    // benchmark. GET /movies/{imdb_id} is unaffected (known Content-Length,
-    // one write).
+    // axum::serve doesn't set TCP_NODELAY. A response written in more than
+    // one piece (GET /movies' body is ~270KB) otherwise meets the classic
+    // Nagle/delayed-ACK stall on its last partial segment.
     let listener = axum::serve::ListenerExt::tap_io(listener, |tcp_stream| {
         if let Err(e) = tcp_stream.set_nodelay(true) {
             eprintln!("failed to set TCP_NODELAY on incoming connection: {e}");
@@ -724,49 +697,51 @@ pub(crate) async fn serve(host: String, port: u16) {
 mod tests {
     use super::*;
 
+    fn spliced(doc: &str, key: &str, value: &str) -> String {
+        let mut body = String::new();
+        push_with_member(&mut body, doc, key, value);
+        body
+    }
+
     #[test]
-    fn splice_member_appends_to_a_stored_doc() {
+    fn push_with_member_appends_to_a_stored_doc() {
         // The ordinary case: a doc this server serialized, gaining one field.
         // Byte-for-byte what serde_json would have produced by parsing the doc
         // into a Value, inserting, and re-serializing — that equivalence is
         // the whole justification for not doing so.
-        let doc = r#"{"title":"The Matrix","imdb_id":"tt0133093"}"#.to_string();
+        let doc = r#"{"title":"The Matrix","imdb_id":"tt0133093"}"#;
         assert_eq!(
-            splice_member(doc, "last_refreshed", "2026-01-01T00:00:00.000+00:00"),
+            spliced(doc, "last_refreshed", "2026-01-01T00:00:00.000+00:00"),
             r#"{"title":"The Matrix","imdb_id":"tt0133093","last_refreshed":"2026-01-01T00:00:00.000+00:00"}"#
         );
     }
 
     #[test]
-    fn splice_member_preserves_non_ascii_verbatim() {
+    fn push_with_member_preserves_non_ascii_verbatim() {
         // SQLite's json_set would escape this to é, making the same movie
         // come back byte-different from /movies and /movies/recent. Splicing
         // never touches the existing bytes, which is why it's preferred.
-        let doc = r#"{"actors":"Penélope Cruz"}"#.to_string();
-        let out = splice_member(doc, "last_refreshed", "2026-01-01T00:00:00.000+00:00");
+        let doc = r#"{"actors":"Penélope Cruz"}"#;
+        let out = spliced(doc, "last_refreshed", "2026-01-01T00:00:00.000+00:00");
         assert!(out.contains("Penélope"), "got: {out}");
     }
 
     #[test]
-    fn splice_member_leaves_anything_it_did_not_write_alone() {
+    fn push_with_member_leaves_anything_it_did_not_write_alone() {
         // A hand-edited row that isn't a non-empty JSON object must come back
         // untouched rather than spliced into invalid JSON.
         for input in ["{}", "", "[]", "null", "not json"] {
             assert_eq!(
-                splice_member(
-                    input.to_string(),
-                    "last_refreshed",
-                    "2026-01-01T00:00:00.000+00:00"
-                ),
+                spliced(input, "last_refreshed", "2026-01-01T00:00:00.000+00:00"),
                 input
             );
         }
     }
 
     #[test]
-    fn splice_member_output_stays_parseable() {
-        let doc = r#"{"a":1,"b":{"nested":"}"},"c":[1,2]}"#.to_string();
-        let out = splice_member(doc, "last_refreshed", "2026-01-01T00:00:00.000+00:00");
+    fn push_with_member_output_stays_parseable() {
+        let doc = r#"{"a":1,"b":{"nested":"}"},"c":[1,2]}"#;
+        let out = spliced(doc, "last_refreshed", "2026-01-01T00:00:00.000+00:00");
         let v: Value = serde_json::from_str(&out).expect("spliced doc parses");
         assert_eq!(v["last_refreshed"], "2026-01-01T00:00:00.000+00:00");
         assert_eq!(v["b"]["nested"], "}");

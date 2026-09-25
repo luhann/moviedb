@@ -16,8 +16,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-bytes = "1"
-futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]

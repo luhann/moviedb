@@ -774,10 +774,8 @@ name = "moviedb"
 version = "2.2.0"
 dependencies = [
  "axum",
- "bytes",
  "chrono",
  "clap",
- "futures-util",
  "mimalloc",
  "r2d2",
  "r2d2_sqlite",
