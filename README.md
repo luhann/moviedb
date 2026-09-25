@@ -98,8 +98,9 @@ systemd-analyze security moviedb   # exposure score; expect ~1.x
 `web/dashboard.html` is a single-file dashboard over the same API, served as a
 static file — nothing builds or bundles it. `scripts/deploy.sh` ships it with
 the binary: the page and `web/fonts/` go to the web root after the API
-restarts, so a failed binary deploy leaves the old page in place. It carries
-the
+restarts, so a failed binary deploy leaves the old page in place.
+`scripts/deploy.sh --web-only` ships just the page and fonts, without
+rebuilding or restarting the API. It carries the
 [patroclus](https://github.com/luhann/patroclus) screen theme: the token block
 at the top of the file is the one my other sites carry, plus the two values
 they have no use for (the meta accent and the shadow), so it can be diffed
@@ -109,13 +110,15 @@ browser under `theme_pref_v2`. The three faces are self-hosted from `web/fonts/`
 rather than pulled from a CDN, so **`fonts/` has to be pushed alongside the
 page** or the type silently falls back.
 
-Mine sits behind a Caddy `file_server`, whose root and port the deploy script
-has to be told about if they aren't the defaults — set `WEB_ROOT=` and
-`WEB_PORT=` alongside `PVE_HOST=`/`VMID=`. The page is pushed under the name
+Mine sits behind a Caddy `file_server`. The page goes straight to that
+container over ssh (`WEB_HOST=`, default `root@omdb.trusted`), not through
+`PVE_HOST=`/`VMID=` like the binary; set `WEB_ROOT=` and `WEB_PORT=` too if
+Caddy's root and port aren't the defaults. The page is pushed under the name
 that root serves as its index. After pushing, the script checks the page's
-checksum on the container and then asks Caddy for the page and for one of the
-fonts, so a font that never landed fails the deploy rather than showing up as
-type that has quietly fallen back.
+checksum on the container, then asks Caddy — and then `PUBLIC_URL=` (default
+`https://omdb.luhann.com`, set empty to skip), through the reverse proxy — for
+the page and every font, so a font that never landed fails the deploy rather
+than showing up as type that has quietly fallen back.
 
 If pushing manually:
 

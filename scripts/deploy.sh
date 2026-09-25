@@ -9,26 +9,38 @@
 # goes straight to the container over ssh, and so doesn't care which node the
 # guest happens to be on.
 #
-# Usage: scripts/deploy.sh
-# Override the target with PVE_HOST=..., VMID=..., WEB_HOST=..., WEB_ROOT=...
-# or WEB_PORT=... in the environment.
+# Usage: scripts/deploy.sh [--web-only]
+#   --web-only  ship just the dashboard and fonts: no build, no smoke test, no
+#               API restart.
+# Override the target with PVE_HOST=..., VMID=..., WEB_HOST=..., WEB_ROOT=...,
+# WEB_PORT=... or PUBLIC_URL=... in the environment.
 set -euo pipefail
+
+WEB_ONLY=0
+case "${1:-}" in
+    "") ;;
+    --web-only) WEB_ONLY=1 ;;
+    *)
+        echo "usage: $0 [--web-only]" >&2
+        exit 2
+        ;;
+esac
 
 # pct is node-local: PVE_HOST must be whichever cluster node currently hosts
 # the container, so both defaults move together if omdb is ever migrated.
 PVE_HOST="${PVE_HOST:-root@fragment2.trusted}"
 VMID="${VMID:-401}"
 BIN="target/x86_64-unknown-linux-musl/release/moviedb"
-# Caddy's `root * ...` and listen address for the dashboard vhost. The
-# Caddyfile itself is stock and untracked, so these two are what have to be
-# kept in step with it by hand.
+# Caddy's `root * ...` and listen address for the dashboard vhost. Those live
+# in the homelab repo's omdb/Caddyfile, so these two are kept in step with it
+# by hand.
 WEB_HOST="${WEB_HOST:-root@omdb.trusted}"
 WEB_ROOT="${WEB_ROOT:-/opt/moviedb/web}"
 WEB_PORT="${WEB_PORT:-8080}"
 # Where the dashboard is actually read from. Checked last, because everything
 # before it can pass on a page nobody can load correctly. Set empty to skip
 # when deploying from somewhere this name doesn't resolve.
-PUBLIC_URL="${PUBLIC_URL:-https://omdb.luhann.com}"
+PUBLIC_URL="${PUBLIC_URL-https://omdb.luhann.com}"
 
 # VMID is interpolated into the remote ssh command below unquoted; reject
 # anything that isn't a plain integer before it gets anywhere near a shell.
@@ -57,13 +69,15 @@ cd "$(dirname "$0")/.."
 # AMD-only instruction. Config wins here; interactive builds are unaffected.
 unset RUSTFLAGS
 
-cargo build --release --locked
-file "$BIN" | grep -q 'static-pie linked' || {
-    echo "ABORT: $BIN is not static-pie linked — wrong toolchain/config?" >&2
-    exit 1
-}
+if (( ! WEB_ONLY )); then
+    cargo build --release --locked
+    file "$BIN" | grep -q 'static-pie linked' || {
+        echo "ABORT: $BIN is not static-pie linked — wrong toolchain/config?" >&2
+        exit 1
+    }
 
-python3 tests/smoke_test.py
+    python3 tests/smoke_test.py
+fi
 
 # The page loads its three faces from web/fonts/ by relative URL. Deploying
 # the page without them leaves the type silently falling back to Georgia and
@@ -79,30 +93,38 @@ shopt -u nullglob
 # One master connection so password auth prompts exactly once; the scp and
 # ssh below multiplex over it.
 CTL="$HOME/.ssh/deploy-moviedb-%r@%h"
-trap 'ssh -o ControlPath="$CTL" -O exit "$PVE_HOST" 2>/dev/null || true;
-      ssh -o ControlPath="$CTL" -O exit "$WEB_HOST" 2>/dev/null || true' EXIT
-ssh -o ControlMaster=yes -o ControlPath="$CTL" -o ControlPersist=60 -fN "$PVE_HOST"
-ssh -o ControlMaster=yes -o ControlPath="$CTL" -o ControlPersist=60 -fN "$WEB_HOST"
+HOSTS=("$WEB_HOST")
+(( WEB_ONLY )) || HOSTS=("$PVE_HOST" "${HOSTS[@]}")
+trap 'for h in "${HOSTS[@]}"; do ssh -o ControlPath="$CTL" -O exit "$h" 2>/dev/null || true; done' EXIT
+for h in "${HOSTS[@]}"; do
+    ssh -o ControlMaster=yes -o ControlPath="$CTL" -o ControlPersist=60 -fN "$h"
+done
 
-scp -o ControlPath="$CTL" "$BIN" "$PVE_HOST:/tmp/moviedb.deploy"
-ssh -o ControlPath="$CTL" "$PVE_HOST" "
-    set -e
-    # push under a temp name, then rename: writing over the running binary
-    # would fail with ETXTBSY. --perms is load-bearing (pct push defaults to
-    # 0644 root:root on every push -> systemd 203/EXEC).
-    pct push $VMID /tmp/moviedb.deploy /opt/moviedb/moviedb.new --perms 0755
-    rm /tmp/moviedb.deploy
-    pct exec $VMID -- mv /opt/moviedb/moviedb.new /opt/moviedb/moviedb
-    pct exec $VMID -- systemctl restart moviedb
-    pct exec $VMID -- systemctl is-active moviedb
-    pct exec $VMID -- /opt/moviedb/moviedb --version
-"
+if (( ! WEB_ONLY )); then
+    scp -o ControlPath="$CTL" "$BIN" "$PVE_HOST:/tmp/moviedb.deploy"
+    ssh -o ControlPath="$CTL" "$PVE_HOST" "
+        set -e
+        # push under a temp name, then rename: writing over the running binary
+        # would fail with ETXTBSY. --perms is load-bearing (pct push defaults to
+        # 0644 root:root on every push -> systemd 203/EXEC).
+        pct push $VMID /tmp/moviedb.deploy /opt/moviedb/moviedb.new --perms 0755
+        rm /tmp/moviedb.deploy
+        pct exec $VMID -- mv /opt/moviedb/moviedb.new /opt/moviedb/moviedb
+        pct exec $VMID -- systemctl restart moviedb
+        pct exec $VMID -- systemctl is-active moviedb
+        pct exec $VMID -- /opt/moviedb/moviedb --version
+    "
+fi
 
 # The dashboard is static: Caddy picks up a new file on the next request, so
 # there is nothing to restart. It goes out after the API rather than before,
 # so a failed binary deploy aborts with the old page still in place.
 WEB_SHA="$(sha256sum web/dashboard.html | cut -d' ' -f1)"
-FONT_PROBE="$(basename "${FONTS[0]}")"
+# Every font, not a sample: any one of the three missing falls back silently.
+PROBE_PATHS="/"
+for f in "${FONTS[@]}"; do
+    PROBE_PATHS+=" /fonts/$(basename "$f")"
+done
 
 ssh -o ControlPath="$CTL" "$WEB_HOST" "mkdir -p /tmp/moviedb-web.deploy/fonts $WEB_ROOT/fonts"
 scp -o ControlPath="$CTL" web/dashboard.html "$WEB_HOST:/tmp/moviedb-web.deploy/index.html"
@@ -129,6 +151,7 @@ ssh -o ControlPath="$CTL" "$WEB_HOST" "
     # Verify the bytes landed, then that Caddy actually serves them — the
     # checksum alone would still pass if the file were unreadable to Caddy's
     # user, and a 200 on the page alone would not notice a missing font.
+    # PROBE_PATHS is word-split on purpose: no font name contains a space.
     #
     # The probe asks Caddy, not the filesystem, so it only proves *this*
     # deploy if WEB_ROOT is the root the Caddyfile names. Point WEB_ROOT
@@ -139,7 +162,7 @@ ssh -o ControlPath="$CTL" "$WEB_HOST" "
         echo \"ABORT: dashboard checksum mismatch on the container\" >&2
         exit 1
     }
-    for url in / '/fonts/$FONT_PROBE'; do
+    for url in $PROBE_PATHS; do
         code=\$(curl -fsS -o /dev/null -w '%{http_code}' \"http://127.0.0.1:$WEB_PORT\$url\") || {
             echo \"ABORT: Caddy did not serve \$url\" >&2
             exit 1
@@ -154,7 +177,7 @@ ssh -o ControlPath="$CTL" "$WEB_HOST" "
 # when it doesn't, the page still returns 200 and quietly renders in the
 # fallback stack. That is what this checks, from where a reader sits.
 if [[ -n "$PUBLIC_URL" ]]; then
-    for path in "/" "/fonts/$FONT_PROBE"; do
+    for path in $PROBE_PATHS; do
         code="$(curl -fsS -o /dev/null -w '%{http_code}' "$PUBLIC_URL$path")" || {
             echo "ABORT: $PUBLIC_URL$path did not load — if the page is fine and" >&2
             echo "       only the font path fails, the reverse proxy is routing" >&2
@@ -165,5 +188,5 @@ if [[ -n "$PUBLIC_URL" ]]; then
     done
 fi
 
-echo "deployed $("$BIN" --version) to LXC $VMID via $PVE_HOST"
+(( WEB_ONLY )) || echo "deployed $("$BIN" --version) to LXC $VMID via $PVE_HOST"
 echo "deployed dashboard + ${#FONTS[@]} fonts to $WEB_HOST:$WEB_ROOT"
