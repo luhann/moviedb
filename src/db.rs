@@ -75,15 +75,12 @@ pub(crate) fn build_pool(
 }
 
 pub(crate) fn ratings_entry_field<'a>(entry: &'a Value, key: &str) -> &'a str {
-    // Stored ratings entries hold snake_case keys ("source"/"value" — OMDB's
-    // "Source"/"Value" are renamed at ingest, see util::snake_case_entry_keys)
-    // and OMDB always sends the values as strings; default to "?" if an entry
-    // is missing the field entirely or holds something else (e.g. a
-    // hand-edited DB row).
+    // "?" for an entry missing the field or holding a non-string (a
+    // hand-edited row); OMDB itself always sends strings.
     entry.get(key).and_then(Value::as_str).unwrap_or("?")
 }
 
-/// Insert one history row per ratings entry. Python: `snapshot_ratings()`.
+/// Insert one history row per ratings entry.
 pub(crate) fn snapshot_ratings(
     db: &Connection,
     imdbid: &str,

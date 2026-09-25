@@ -4,7 +4,8 @@ Runs the real binary against a stub OMDB server and a temp DB: the full
 endpoint matrix (auth, POST /movies, GET /movies with and without filters,
 GET /movies/recent, GET /movies/{imdb_id}, GET /movies/{imdb_id}/history,
 error paths incl. the problem+json contract on unmatched paths/methods)
-plus refresh edge cases (null Personal rating, OMDB response missing Title).
+plus refresh edge cases (null Personal rating, OMDB response missing Title,
+a re-rate landing mid-run, rejected key, quota, transient OMDB failures).
 
 Usage:
     python3 tests/smoke_test.py [path-to-binary]
@@ -43,26 +44,62 @@ OMDB_DOC = {
     "Response": "True",
 }
 
+# Set in main(): the stub re-rates a movie mid-refresh through it.
+STUB_DB = None
+
+
+def rerate_mid_run(imdb_id, value):
+    """What a POST /movies landing during a refresh run does to the row."""
+    con = sqlite3.connect(STUB_DB)
+    doc = json.loads(
+        con.execute("SELECT data FROM movies WHERE imdb_id = ?", (imdb_id,)).fetchone()[0]
+    )
+    doc["ratings"][-1]["value"] = value
+    con.execute(
+        "UPDATE movies SET data = ? WHERE imdb_id = ?", (json.dumps(doc), imdb_id)
+    )
+    con.commit()
+    con.close()
+
 
 class Stub(BaseHTTPRequestHandler):
     def do_GET(self):
         q = parse_qs(urlparse(self.path).query)
+        apikey = q.get("apikey", [""])[0]
         title = q.get("t", [""])[0]
-        if title == "TriggerDailyLimit":
+        imdb_id = q.get("i", [""])[0]
+        status = 200
+        if apikey == "revoked":
+            status, doc = 401, {"Response": "False", "Error": "Invalid API key!"}
+        elif apikey == "exhausted" or title == "TriggerDailyLimitAlt":
+            doc = {"Response": "False", "Error": "Request limit reached!"}
+        elif title == "TriggerDailyLimit":
             doc = {"Response": "False", "Error": "Daily request limit reached!"}
         elif title == "TriggerUnknownError":
             doc = {
                 "Response": "False",
                 "Error": "Some new OMDB error this stub doesn't know",
             }
+        elif imdb_id.startswith("ttfail"):
+            body = b"<html>upstream exploded</html>"
+            self.send_response(502)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        elif imdb_id == "tt0000005":
+            doc = {"Response": "False", "Error": "Error getting data."}
         else:
             doc = dict(OMDB_DOC)
+            if imdb_id:
+                doc["imdbID"] = imdb_id
             # refresh-by-id path: tt0000002 gets Response=True with no Title
-            if q.get("i", [""])[0] == "tt0000002":
+            if imdb_id == "tt0000002":
                 del doc["Title"]
-                doc["imdbID"] = "tt0000002"
+            if imdb_id == "tt0000003":
+                rerate_mid_run(imdb_id, "RERATED")
         body = json.dumps(doc).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -88,12 +125,41 @@ def req(method, path, key=KEY):
     return status, body
 
 
+def scenario_db(tmp, src, name, keep_ids, extra_rows=()):
+    """A copy of `src` holding only `keep_ids` plus `extra_rows`."""
+    path = os.path.join(tmp, name + ".db")
+    con = sqlite3.connect(src)
+    con.execute("VACUUM INTO ?", (path,))
+    con.close()
+    con = sqlite3.connect(path)
+    marks = ",".join("?" * len(keep_ids))
+    con.execute(f"DELETE FROM movies WHERE imdb_id NOT IN ({marks})", keep_ids)
+    for imdb_id, doc in extra_rows:
+        con.execute("INSERT INTO movies VALUES (?, ?)", (imdb_id, json.dumps(doc)))
+    con.commit()
+    con.close()
+    return path
+
+
+def movie_data(db_path, imdb_id):
+    con = sqlite3.connect(db_path)
+    row = con.execute("SELECT data FROM movies WHERE imdb_id = ?", (imdb_id,)).fetchone()
+    con.close()
+    return row[0]
+
+
+def rated(title, value="8/10"):
+    return {"title": title, "ratings": [{"source": "Personal", "value": value}]}
+
+
 def main():
+    global STUB_DB
     if not os.path.exists(BIN):
         sys.exit(f"binary not found: {BIN} — build it or pass a path")
     results = []
     with tempfile.TemporaryDirectory() as tmp:
         db_path = os.path.join(tmp, "smoke.db")
+        STUB_DB = db_path
         srv = HTTPServer(("127.0.0.1", 8098), Stub)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         env = dict(
@@ -167,6 +233,14 @@ def main():
                     and doc["ratings"][-1] == {"source": "Personal", "value": "9/10"}
                     and "response" not in doc
                     and headers.get("location") == "/movies/tt0133093",
+                )
+            )
+            # POST is a fresh OMDB pull, so it stamps _refreshed like refresh
+            # does — a newly added movie must not jump the next refresh queue.
+            results.append(
+                (
+                    "POST stamps _refreshed",
+                    doc.get("_refreshed", "").endswith("+00:00"),
                 )
             )
 
@@ -284,6 +358,17 @@ def main():
                 )
             )
 
+            # OMDB has been seen sending this spelling of the same error.
+            s, b, headers = req_full(
+                "POST", "/movies?title=TriggerDailyLimitAlt&rating=1&year=2000"
+            )
+            results.append(
+                (
+                    "503 on OMDB's alternate daily-limit wording",
+                    s == 503 and headers.get("retry-after") == "86400",
+                )
+            )
+
             # An OMDB error this server doesn't recognize is a bad response
             # from an upstream dependency — 502, not the non-standard 520.
             s, b = req("POST", "/movies?title=TriggerUnknownError&rating=1&year=2000")
@@ -354,6 +439,22 @@ def main():
             ("refuses empty API_KEY", p.returncode == 1 and "API_KEY" in p.stderr)
         )
 
+        # DB_PATH= must mean "unset" (the default path), not an empty path,
+        # which SQLite opens as a private temp DB per pooled connection.
+        # Nothing on a workstation has the default path, so it fails there.
+        try:
+            p = subprocess.run(
+                [BIN, "serve", "--host", "127.0.0.1", "--port", "8124"],
+                env=dict(env, DB_PATH=""),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            empty_db_path_ok = "/var/lib/moviedb/movies.db" in p.stderr
+        except subprocess.TimeoutExpired:
+            empty_db_path_ok = False
+        results.append(("empty DB_PATH falls back to the default", empty_db_path_ok))
+
         # refresh edge cases: null Personal Value skips without an OMDB call;
         # Response=True missing Title skips without persisting
         db = sqlite3.connect(db_path)
@@ -378,6 +479,14 @@ def main():
             }
         )
         db.execute("INSERT INTO movies VALUES (?, ?)", ("tt0000002", b_doc))
+        db.execute(
+            "INSERT INTO movies VALUES (?, ?)",
+            ("tt0000003", json.dumps(rated("Rerated", "5/10"))),
+        )
+        db.execute(
+            "INSERT INTO movies VALUES (?, ?)",
+            ("tt0000005", json.dumps(rated("GoneFromOmdb"))),
+        )
         db.commit()
         db.close()
 
@@ -409,7 +518,107 @@ def main():
                 "OK   The Matrix (1999)" in out.stdout and out.returncode == 0,
             )
         )
+        rerated = json.loads(movie_data(db_path, "tt0000003"))
+        results.append(
+            (
+                "refresh: keeps a re-rate that landed mid-run",
+                rerated["ratings"][-1] == {"source": "Personal", "value": "RERATED"}
+                and "_refreshed" in rerated,
+            )
+        )
+        results.append(
+            (
+                "refresh: unknown id skipped, run still succeeds",
+                "SKIP GoneFromOmdb [tt0000005]" in out.stdout,
+            )
+        )
         db.close()
+
+        refresh_env = dict(env)
+        del refresh_env["DB_PATH"]
+
+        def run_refresh(path, *extra, **env_over):
+            return subprocess.run(
+                [BIN, "refresh", path, "--sleep", "0", *extra],
+                env=dict(refresh_env, **env_over),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+        # One transient failure is moved past, but still fails the unit.
+        path = scenario_db(
+            tmp, db_path, "transient", ["tt0133093"], [("ttfail1", rated("Flaky"))]
+        )
+        out = run_refresh(path)
+        results.append(
+            (
+                "refresh: continues past a transient failure, exits non-zero",
+                out.returncode == 1
+                and "FAIL Flaky" in out.stderr
+                and "OK   The Matrix" in out.stdout
+                and "1 failed" in out.stdout,
+            )
+        )
+
+        # Three in a row means OMDB is down: stop rather than time out on
+        # every remaining movie. The Matrix is stamped, so it sorts last.
+        path = scenario_db(
+            tmp,
+            db_path,
+            "outage",
+            ["tt0133093"],
+            [(f"ttfail{i}", rated(f"Flaky{i}")) for i in range(3)],
+        )
+        out = run_refresh(path)
+        results.append(
+            (
+                "refresh: aborts after consecutive failures",
+                out.returncode == 1
+                and "failed in a row" in out.stderr
+                and "1 remaining" in out.stdout,
+            )
+        )
+
+        # A rejected key would otherwise "skip" every movie and exit 0.
+        path = scenario_db(tmp, db_path, "revoked", ["tt0133093"])
+        before = movie_data(path, "tt0133093")
+        out = run_refresh(path, OMDB_KEY="revoked")
+        results.append(
+            (
+                "refresh: rejected OMDB key aborts non-zero",
+                out.returncode == 1
+                and "Invalid API key" in out.stderr
+                and movie_data(path, "tt0133093") == before,
+            )
+        )
+
+        # The quota running out is expected and resumable: stop, exit 0.
+        path = scenario_db(tmp, db_path, "exhausted", ["tt0133093"])
+        before = movie_data(path, "tt0133093")
+        out = run_refresh(path, OMDB_KEY="exhausted")
+        results.append(
+            (
+                "refresh: alternate daily-limit wording stops cleanly",
+                out.returncode == 0
+                and "daily limit hit" in out.stdout
+                and movie_data(path, "tt0133093") == before,
+            )
+        )
+
+        out = subprocess.run(
+            [BIN, "refresh", db_path, "--sleep=-1"],
+            env=refresh_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        results.append(
+            (
+                "refresh: rejects a negative --sleep",
+                out.returncode == 2 and "negative" in out.stderr,
+            )
+        )
 
     ok = True
     for name, passed in results:

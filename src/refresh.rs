@@ -2,15 +2,22 @@
 //! oldest-refreshed first, preserving each movie's Personal rating.
 
 use std::collections::HashMap;
-use std::env;
-use std::process::exit;
+use std::error::Error;
+use std::process::{ExitCode, exit};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde_json::{Map, Value};
 
 use crate::db::{ratings_entry_field, set_connection_pragmas, snapshot_ratings};
-use crate::util::{DEFAULT_OMDB_URL, normalize_omdb, utcnow};
+use crate::util::{
+    DEFAULT_OMDB_URL, OmdbError, classify_omdb_error, env_nonempty, normalize_omdb, utcnow,
+};
+
+/// Transient failures in a row before the run gives up: one timeout is
+/// worth skipping past, but a run of them means OMDB (or the network) is
+/// down, and every further movie would just burn its timeout.
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// The first ratings entry with source == "Personal". A missing entry or a
 /// JSON-null value both mean "not rated yet" and should be skipped; an
@@ -23,16 +30,6 @@ fn personal_rating(doc: &Value) -> Option<Value> {
         }
     }
     None
-}
-
-/// Normalizes a Response=True OMDB payload (via the shared `util::normalize_omdb`)
-/// and stamps `_refreshed` so the next run's oldest-first ordering advances.
-/// `personal_value` is passed through as-is (not stringified) so a
-/// non-string Personal rating from a hand-edited DB row round-trips correctly.
-fn rebuild_doc(omdb: &Map<String, Value>, personal_value: &Value, now: &str) -> Map<String, Value> {
-    let mut out = normalize_omdb(omdb.clone(), personal_value.clone());
-    out.insert("_refreshed".to_string(), Value::String(now.to_string()));
-    out
 }
 
 fn doc_str<'a>(doc: &'a Value, key: &str, default: &'a str) -> &'a str {
@@ -76,9 +73,6 @@ fn dry_run_diff(old_doc: &Value, new_ratings: &[Value]) -> String {
             None => changed.push(format!("{s}: (new) -> {v}")),
         }
     }
-    // Sources present in the old doc but absent from the fresh fetch —
-    // the loop above only walks new_ratings, so without this a source
-    // OMDB dropped vanishes from the diff instead of being reported.
     let mut removed: Vec<String> = Vec::new();
     for (s, old_v) in &old {
         if *s == "Personal" {
@@ -99,22 +93,17 @@ fn dry_run_diff(old_doc: &Value, new_ratings: &[Value]) -> String {
 }
 
 fn require_omdb_key() -> String {
-    match env::var("OMDB_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => {
-            eprintln!("OMDB_KEY not set. Try: export $(grep OMDB_KEY /etc/moviedb.env)");
-            exit(1);
-        }
-    }
+    env_nonempty("OMDB_KEY").unwrap_or_else(|| {
+        eprintln!("OMDB_KEY not set. Try: export $(grep OMDB_KEY /etc/moviedb.env)");
+        exit(1);
+    })
 }
 
 /// Deliberately opened without `SQLITE_OPEN_CREATE` (unlike the server's
-/// schema-creating `db::build_pool`): a typo'd `db_path` must fail right
-/// here at open — a default `Connection::open` would create an empty DB
-/// file at the bad path and only fail at the first SELECT, leaving the
-/// stray file behind. Pragmas are per-connection though (see
-/// `set_connection_pragmas`), so they still need setting here even though
-/// `serve` already put the file into WAL mode.
+/// schema-creating `db::build_pool`): a typo'd `db_path` must fail here at
+/// open rather than leave an empty DB file behind at the bad path. Pragmas
+/// are per-connection, so they still need setting even though `serve`
+/// already put the file into WAL mode.
 fn open_db(db_path: &str) -> Connection {
     let mut db = match Connection::open_with_flags(
         db_path,
@@ -133,86 +122,68 @@ fn open_db(db_path: &str) -> Connection {
     db
 }
 
-/// All movies, oldest-`_refreshed` first (never-refreshed movies sort
-/// first, so freshly-added ones get picked up before anything else), capped
-/// to the first `limit` if given.
+/// The `limit` oldest-`_refreshed` movies (all of them if `None`). Rows with
+/// no stamp at all sort first.
 fn load_movies(db: &Connection, limit: Option<usize>) -> Vec<(String, String)> {
+    // SQLite reads a negative LIMIT as "no limit".
+    let limit = limit.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
     let rows_result = (|| -> rusqlite::Result<Vec<(String, String)>> {
         let mut stmt = db.prepare(
             "
         SELECT imdb_id, data FROM movies
         ORDER BY COALESCE(json_extract(data, '$._refreshed'), '') ASC
+        LIMIT ?
         ",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect()
     })();
-    let mut rows = match rows_result {
-        Ok(rows) => rows,
-        Err(e) => {
-            eprintln!("query failed: {e}");
-            exit(1);
-        }
-    };
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    rows
+    rows_result.unwrap_or_else(|e| {
+        eprintln!("query failed: {e}");
+        exit(1);
+    })
 }
 
 fn build_omdb_client() -> reqwest::Client {
-    // 15s timeout: generous for a slow OMDB response without letting one
-    // stuck request hang an entire (potentially unattended, cron-driven) run.
+    // 15s: generous for a slow OMDB response without letting one stuck
+    // request hang an unattended run.
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .expect("failed to build HTTP client")
 }
 
-/// Fixed config threaded through every `refresh_movie` call — grouped into
-/// one struct so adding a call doesn't mean adding another positional arg.
+/// Fixed config threaded through every `refresh_movie` call.
 struct RefreshConfig<'a> {
     client: &'a reqwest::Client,
     omdb_url: &'a str,
     api_key: &'a str,
-    sleep_secs: f64,
     dry_run: bool,
 }
 
 enum RefreshOutcome {
     Refreshed,
     Skipped,
-    /// OMDB's daily cap was hit fetching this movie — stop the whole run,
-    /// not just this one movie; progress so far is already committed.
+    /// Worth moving past (a timeout, a garbled response) — the movie keeps
+    /// its old `_refreshed`, so it sorts first next run.
+    Failed,
+    /// OMDB's daily cap was hit: stop cleanly, progress so far is committed.
     DailyLimitReached,
+    /// Nothing later in the run can succeed either (a rejected key, an OMDB
+    /// error this code doesn't know, a DB write failing): stop and fail.
+    Fatal,
 }
 
-/// Refreshes a single movie: skips it if it has no Personal rating yet, or
-/// if OMDB no longer recognizes it; otherwise merges the fresh OMDB data
-/// with the preserved Personal rating and either prints a dry-run diff or
-/// writes the movie plus a `ratings_history` snapshot.
+/// Re-pulls one movie and either prints a dry-run diff or writes the movie
+/// plus a `ratings_history` snapshot. Always makes exactly one OMDB request.
 async fn refresh_movie(
     db: &mut Connection,
     cfg: &RefreshConfig<'_>,
     imdb_id: &str,
-    data: &str,
+    stored: &Value,
 ) -> RefreshOutcome {
-    let doc: Value = match serde_json::from_str(data) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("invalid JSON for {imdb_id}: {e}");
-            exit(1);
-        }
-    };
-    let Some(rating) = personal_rating(&doc) else {
-        println!(
-            "SKIP {}: no Personal rating",
-            doc_str(&doc, "title", imdb_id)
-        );
-        return RefreshOutcome::Skipped;
-    };
-
-    let omdb: Value = match async {
+    let label = doc_str(stored, "title", imdb_id);
+    let response: reqwest::Result<Value> = async {
         cfg.client
             .get(cfg.omdb_url)
             .query(&[("apikey", cfg.api_key), ("i", imdb_id)])
@@ -221,88 +192,117 @@ async fn refresh_movie(
             .json()
             .await
     }
-    .await
-    {
-        Ok(v) => v,
+    .await;
+    let omdb = match response {
+        Ok(Value::Object(obj)) if obj.get("Response").and_then(Value::as_str) == Some("True") => {
+            obj
+        }
+        Ok(other) => {
+            let error = doc_str(&other, "Error", "");
+            return match classify_omdb_error(error) {
+                OmdbError::DailyLimit => RefreshOutcome::DailyLimitReached,
+                OmdbError::NotFound => {
+                    println!("SKIP {label} [{imdb_id}]: {error}");
+                    RefreshOutcome::Skipped
+                }
+                OmdbError::Other => {
+                    eprintln!("ABORT at {label} [{imdb_id}]: OMDB error {error:?}");
+                    RefreshOutcome::Fatal
+                }
+            };
+        }
+        // without_url(): the request URL carries the apikey.
         Err(e) => {
-            // without_url(): strip the apikey-bearing request URL before
-            // this hits stdout/journalctl.
-            eprintln!("OMDB request failed for {imdb_id}: {}", e.without_url());
-            exit(1);
+            eprintln!(
+                "FAIL {label} [{imdb_id}]: OMDB request failed: {}",
+                e.without_url()
+            );
+            return RefreshOutcome::Failed;
         }
     };
 
-    if omdb.get("Response").and_then(Value::as_str) != Some("True") {
-        let error = omdb.get("Error").and_then(Value::as_str).unwrap_or("");
-        if error == "Daily request limit reached!" {
-            return RefreshOutcome::DailyLimitReached;
-        }
-        println!(
-            "SKIP {} [{}]: {}",
-            doc_str(&doc, "title", "?"),
-            imdb_id,
-            error
-        );
-        // An OMDB call was still made for this movie — sleep the same as
-        // every other post-request path below, or a run full of
-        // not-found/renamed titles hammers OMDB with no throttling at all.
-        tokio::time::sleep(Duration::from_secs_f64(cfg.sleep_secs)).await;
-        return RefreshOutcome::Skipped;
-    }
-
-    let now = utcnow();
-    let omdb_obj = omdb.as_object().expect("OMDB response is a JSON object");
-    let new_doc = rebuild_doc(omdb_obj, &rating, &now);
-    let new_ratings = new_doc
-        .get("ratings")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    // A Response=True doc without Title would persist with a NULL generated
-    // title column, permanently breaking ?title=&year= lookups — skip
-    // instead of writing it.
-    let Some(title) = new_doc.get("title").and_then(Value::as_str) else {
+    // A doc without a title would persist with a NULL generated `title`
+    // column, invisible to ?title= filters — skip rather than write it.
+    let Some(title) = omdb.get("Title").and_then(Value::as_str).map(String::from) else {
         println!("SKIP {imdb_id}: OMDB response missing Title — not persisted");
-        tokio::time::sleep(Duration::from_secs_f64(cfg.sleep_secs)).await;
         return RefreshOutcome::Skipped;
     };
-    let year = new_doc.get("year").and_then(Value::as_str).unwrap_or("?");
+    let year = omdb
+        .get("Year")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string();
+    let now = utcnow();
 
     if cfg.dry_run {
+        let personal = personal_rating(stored).unwrap_or(Value::Null);
+        let new_doc = normalize_omdb(omdb, personal, &now);
+        let new_ratings = new_doc["ratings"].as_array().map_or(&[][..], Vec::as_slice);
         println!(
             "DRY  {title} ({year}): {}",
-            dry_run_diff(&doc, &new_ratings)
+            dry_run_diff(stored, new_ratings)
         );
-        tokio::time::sleep(Duration::from_secs_f64(cfg.sleep_secs)).await;
         return RefreshOutcome::Refreshed;
     }
 
-    let new_data = serde_json::to_string(&new_doc).expect("doc serializes");
-    let result = (|| -> rusqlite::Result<()> {
-        // Immediate for the same reason as http::upsert_movie: write
-        // transactions take the write lock up front, where busy_timeout
-        // applies, instead of risking a stale-snapshot upgrade failure
-        // against the concurrently-serving API process.
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE movies SET data = ? WHERE imdb_id = ?",
-            params![new_data, imdb_id],
-        )?;
-        snapshot_ratings(&tx, imdb_id, title, &new_ratings, &now)?;
-        tx.commit()
-    })();
-    if let Err(e) = result {
-        eprintln!("write failed for {imdb_id}: {e}");
-        exit(1);
+    match write_refreshed(db, imdb_id, &title, omdb, &now) {
+        Ok(true) => {
+            println!("OK   {title} ({year})");
+            RefreshOutcome::Refreshed
+        }
+        Ok(false) => {
+            println!("SKIP {title}: Personal rating removed during the run");
+            RefreshOutcome::Skipped
+        }
+        Err(e) => {
+            eprintln!("ABORT at {imdb_id}: write failed: {e}");
+            RefreshOutcome::Fatal
+        }
     }
-    println!("OK   {title} ({year})");
-    tokio::time::sleep(Duration::from_secs_f64(cfg.sleep_secs)).await;
-    RefreshOutcome::Refreshed
 }
 
-pub(crate) async fn refresh(db_path: String, limit: Option<usize>, sleep_secs: f64, dry_run: bool) {
+/// Writes the refreshed doc and its snapshot. The Personal rating is read
+/// here, inside the write lock, not taken from the copy loaded at the start
+/// of the run: a re-rate POSTed while the run was working through earlier
+/// movies would otherwise be overwritten with the old value. Returns false
+/// if the movie no longer has a Personal rating to carry over.
+fn write_refreshed(
+    db: &mut Connection,
+    imdb_id: &str,
+    title: &str,
+    omdb: Map<String, Value>,
+    now: &str,
+) -> Result<bool, Box<dyn Error>> {
+    // Immediate for the same reason as http::upsert_movie: take the write
+    // lock up front, where busy_timeout applies.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current: String = tx.query_row(
+        "SELECT data FROM movies WHERE imdb_id = ?",
+        params![imdb_id],
+        |r| r.get(0),
+    )?;
+    let Some(personal) = personal_rating(&serde_json::from_str(&current)?) else {
+        return Ok(false);
+    };
+    let new_doc = normalize_omdb(omdb, personal, now);
+    let new_ratings = new_doc["ratings"].as_array().map_or(&[][..], Vec::as_slice);
+    tx.execute(
+        "UPDATE movies SET data = ? WHERE imdb_id = ?",
+        params![serde_json::to_string(&new_doc)?, imdb_id],
+    )?;
+    snapshot_ratings(&tx, imdb_id, title, new_ratings, now)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+pub(crate) async fn refresh(
+    db_path: String,
+    limit: Option<usize>,
+    pause: Duration,
+    dry_run: bool,
+) -> ExitCode {
     let api_key = require_omdb_key();
-    let omdb_url = env::var("OMDB_URL").unwrap_or_else(|_| DEFAULT_OMDB_URL.to_string());
+    let omdb_url = env_nonempty("OMDB_URL").unwrap_or_else(|| DEFAULT_OMDB_URL.to_string());
     let mut db = open_db(&db_path);
     let rows = load_movies(&db, limit);
     let total = rows.len();
@@ -311,29 +311,75 @@ pub(crate) async fn refresh(db_path: String, limit: Option<usize>, sleep_secs: f
         client: &client,
         omdb_url: &omdb_url,
         api_key: &api_key,
-        sleep_secs,
         dry_run,
     };
 
-    let mut refreshed = 0usize;
-    let mut skipped = 0usize;
+    let (mut refreshed, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    let mut consecutive_failures = 0;
+    let mut fatal = false;
     for (imdb_id, data) in &rows {
-        match refresh_movie(&mut db, &cfg, imdb_id, data).await {
-            RefreshOutcome::Refreshed => refreshed += 1,
-            RefreshOutcome::Skipped => skipped += 1,
+        let stored: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("FAIL {imdb_id}: stored doc is not valid JSON: {e}");
+                failed += 1;
+                continue;
+            }
+        };
+        // Checked before the request so an unrated movie costs no quota.
+        // The authoritative read is inside the write (see write_refreshed).
+        if personal_rating(&stored).is_none() {
+            println!(
+                "SKIP {}: no Personal rating",
+                doc_str(&stored, "title", imdb_id)
+            );
+            skipped += 1;
+            continue;
+        }
+
+        match refresh_movie(&mut db, &cfg, imdb_id, &stored).await {
+            RefreshOutcome::Refreshed => {
+                refreshed += 1;
+                consecutive_failures = 0;
+            }
+            RefreshOutcome::Skipped => {
+                skipped += 1;
+                consecutive_failures = 0;
+            }
+            RefreshOutcome::Failed => {
+                failed += 1;
+                consecutive_failures += 1;
+                if consecutive_failures == MAX_CONSECUTIVE_FAILURES {
+                    eprintln!("ABORT: {MAX_CONSECUTIVE_FAILURES} OMDB requests failed in a row");
+                    fatal = true;
+                    break;
+                }
+            }
             RefreshOutcome::DailyLimitReached => {
                 println!(
                     "OMDB daily limit hit after {refreshed} refreshes. Re-run tomorrow — progress is saved."
                 );
                 break;
             }
+            RefreshOutcome::Fatal => {
+                fatal = true;
+                break;
+            }
         }
+        tokio::time::sleep(pause).await;
     }
 
+    let processed = refreshed + skipped + failed;
+    let verb = if dry_run { "checked" } else { "refreshed" };
     println!(
-        "\nDone: {refreshed} refreshed, {skipped} skipped, {} remaining.",
-        total - refreshed - skipped
+        "\nDone: {refreshed} {verb}, {skipped} skipped, {failed} failed, {} remaining.",
+        total - processed
     );
+    if fatal || failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 #[cfg(test)]
@@ -378,64 +424,6 @@ mod tests {
             personal_rating(&json!({"ratings": [{"source": "Personal", "value": 0}]})),
             Some(json!(0))
         );
-    }
-
-    #[test]
-    fn rebuild_doc_snake_cases_keys_folds_ratings_and_appends_personal() {
-        let omdb = json!({
-            "Title": "The Matrix",
-            "Year": "1999",
-            "imdbID": "tt0133093",
-            "BoxOffice": "$172,076,928",
-            "Ratings": [{"Source": "Internet Movie Database", "Value": "8.7/10"}],
-            "Response": "True",
-        });
-        let out = rebuild_doc(
-            omdb.as_object().unwrap(),
-            &json!("9/10"),
-            "2026-01-01T00:00:00+00:00",
-        );
-
-        assert_eq!(out.get("title"), Some(&json!("The Matrix")));
-        assert_eq!(out.get("year"), Some(&json!("1999")));
-        // Multi-word / acronym OMDB keys land as snake_case.
-        assert_eq!(out.get("imdb_id"), Some(&json!("tt0133093")));
-        assert_eq!(out.get("box_office"), Some(&json!("$172,076,928")));
-        // "Response" is dropped entirely, not just renamed.
-        assert!(!out.contains_key("response"));
-        assert!(!out.contains_key("Response"));
-        assert_eq!(
-            out.get("_refreshed"),
-            Some(&json!("2026-01-01T00:00:00+00:00"))
-        );
-        let ratings = out.get("ratings").unwrap().as_array().unwrap();
-        assert_eq!(
-            *ratings,
-            vec![
-                json!({"source": "Internet Movie Database", "value": "8.7/10"}),
-                json!({"source": "Personal", "value": "9/10"}),
-            ]
-        );
-    }
-
-    #[test]
-    fn rebuild_doc_adds_ratings_key_when_omdb_omitted_it() {
-        let omdb = json!({"Title": "No Ratings Field"});
-        let out = rebuild_doc(omdb.as_object().unwrap(), &json!("5/10"), "now");
-        assert_eq!(
-            out.get("ratings").unwrap().as_array().unwrap(),
-            &vec![json!({"source": "Personal", "value": "5/10"})]
-        );
-    }
-
-    #[test]
-    fn rebuild_doc_preserves_non_string_personal_value() {
-        // A manually-edited DB row could have a non-string Personal value;
-        // rebuild_doc must round-trip it as-is, not stringify it.
-        let omdb = json!({"Title": "X"});
-        let out = rebuild_doc(omdb.as_object().unwrap(), &json!(9), "now");
-        let ratings = out.get("ratings").unwrap().as_array().unwrap();
-        assert_eq!(ratings[0]["value"], json!(9));
     }
 
     #[test]

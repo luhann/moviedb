@@ -154,8 +154,14 @@ Up to you. I use [traefik](https://github.com/traefik/traefik) as my reverse pro
   "current as of migration at the latest".
 - **Refreshing**: `moviedb refresh [db_path]` re-pulls by imdbid, preserves
   the Personal rating, and is resumable across OMDB's 1000/day limit (oldest-
-  refreshed-first ordering + `_refreshed` timestamps). `--dry-run` prints
-  rating deltas without writing; `--sleep` throttles (default 0.5s).
+  refreshed-first ordering + `_refreshed` timestamps, which POST stamps too,
+  since it is just as fresh a pull). The Personal rating is re-read inside
+  each write, so a re-rate made while a run is in progress survives it.
+  Hitting the daily limit stops the run cleanly (exit 0). A timeout or
+  garbled response skips that movie, and the run exits non-zero at the end;
+  three in a row, a rejected key, or an OMDB error it doesn't recognise
+  stop the run at once, also non-zero. `--dry-run` prints rating deltas
+  without writing; `--sleep` throttles (default 0.5s).
   `moviedb-refresh.timer` runs it monthly in the same sandbox as the API;
   logs land in `journalctl -u moviedb-refresh`. Trigger manually with
   `systemctl start moviedb-refresh`. **Don't run real refreshes directly as

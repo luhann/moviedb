@@ -308,8 +308,8 @@ components:
       type: object
       description: |
         A stored movie doc: OMDB's payload with every key snake_cased, plus a
-        `ratings` array with the `Personal` entry appended. OMDB's `Response`
-        field is dropped as redundant. Only the fields this API itself
+        `ratings` array with the `Personal` entry appended and a `_refreshed`
+        stamp. OMDB's `Response` field is dropped as redundant. Only the fields this API itself
         guarantees are listed — everything else OMDB returns is passed
         through untouched.
       required: [imdb_id, title, ratings]
@@ -334,6 +334,13 @@ components:
           description: Always present; the `Personal` entry is always last.
           items:
             $ref: "#/components/schemas/Rating"
+        _refreshed:
+          type: string
+          description: |
+            When this doc was last pulled from OMDB, by POST or by `refresh`
+            (UTC, millisecond precision, `+00:00` suffix). Absent only on rows
+            predating POST stamping it.
+          examples: ["2026-07-17T12:34:56.789+00:00"]
       additionalProperties: true
 
     RecentMovie:

@@ -13,21 +13,21 @@ mod http;
 mod refresh;
 mod util;
 
-use std::env;
-use std::process::exit;
+use std::process::{ExitCode, exit};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
 use db::DB_POOL_SIZE;
+use util::env_nonempty;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // Headroom above DB_POOL_SIZE for non-DB blocking work. At most DB_POOL_SIZE blocking
-// threads ever do DB work, so this headroom stays genuinely free for DNS. Sized for one user: POST / is
-// the only handler that resolves DNS, so 4 is already generous, and total
-// threads (workers + blocking pool) must stay comfortably under the systemd
-// unit's TasksMax=32.
+// threads ever do DB work, so this headroom stays free for DNS. POST /movies is
+// the only handler that resolves DNS, so 4 is generous, and total threads
+// (workers + blocking pool) must stay comfortably under the unit's TasksMax=32.
 const BLOCKING_POOL_HEADROOM: usize = 4;
 
 #[derive(Parser)]
@@ -54,15 +54,20 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
         /// Seconds to sleep between OMDB requests
-        #[arg(long, default_value_t = 0.5)]
-        sleep: f64,
+        #[arg(long, default_value = "0.5", value_parser = parse_seconds)]
+        sleep: Duration,
         /// Print rating deltas without writing
         #[arg(long)]
         dry_run: bool,
     },
 }
 
-fn main() {
+fn parse_seconds(s: &str) -> Result<Duration, String> {
+    let secs: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    Duration::try_from_secs_f64(secs).map_err(|e| e.to_string())
+}
+
+fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Every DB-touching handler runs its query on a spawn_blocking thread,
@@ -77,21 +82,25 @@ fn main() {
         .expect("failed to build tokio runtime")
         .block_on(async {
             match cli.command {
-                Command::Serve { host, port } => http::serve(host, port).await,
+                Command::Serve { host, port } => {
+                    http::serve(host, port).await;
+                    ExitCode::SUCCESS
+                }
                 Command::Refresh {
                     db_path,
                     limit,
                     sleep,
                     dry_run,
                 } => {
-                    let db_path = db_path
-                        .or_else(|| env::var("DB_PATH").ok().filter(|s| !s.is_empty()))
-                        .unwrap_or_else(|| {
-                            eprintln!("moviedb refresh: no db_path given and DB_PATH not set");
-                            exit(2);
-                        });
-                    refresh::refresh(db_path, limit, sleep, dry_run).await;
+                    let db_path =
+                        db_path
+                            .or_else(|| env_nonempty("DB_PATH"))
+                            .unwrap_or_else(|| {
+                                eprintln!("moviedb refresh: no db_path given and DB_PATH not set");
+                                exit(2);
+                            });
+                    refresh::refresh(db_path, limit, sleep, dry_run).await
                 }
             }
-        });
+        })
 }

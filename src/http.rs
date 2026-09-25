@@ -11,9 +11,8 @@
 //! points at), and title/year lookup is a *filter on the collection* via the
 //! indexed generated columns. A filter matching several movies returns them
 //! all, and one matching none returns `[]` — with a non-unique key,
-//! multiple/zero matches are data, not errors, so the old 300/404 answers
-//! for title+year lookups are gone with the lookup endpoint itself. Only
-//! `/movies/{imdb_id}` can 404. Every POST snapshots the full ratings array
+//! multiple/zero matches are data, not errors. Only `/movies/{imdb_id}` can
+//! 404. Every POST snapshots the full ratings array
 //! into `ratings_history`, making rating drift observable, and returns the
 //! stored movie doc as JSON: 201 + `Location` if this `imdb_id` is new, 200
 //! if it already existed. Collection responses (`/movies`, `/movies/recent`)
@@ -38,7 +37,6 @@
 //!       stayed busy past the load-shed deadline (see `Retry-After` on both)
 //!   500 internal error (see server logs for detail)
 
-use std::env;
 use std::process::exit;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,12 +56,14 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 
 use crate::db::{DB_POOL_SIZE, build_pool, snapshot_ratings};
-use crate::util::{DEFAULT_OMDB_URL, ct_eq, normalize_omdb, utcnow};
+use crate::util::{
+    DEFAULT_OMDB_URL, OmdbError, classify_omdb_error, ct_eq, env_nonempty, normalize_omdb, utcnow,
+};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/moviedb/movies.db";
 
@@ -260,9 +260,8 @@ struct RecentParams {
 const DEFAULT_RECENT_LIMIT: usize = 10;
 const MAX_RECENT_LIMIT: usize = 50;
 
-/// Like `axum::extract::Query`, but a parse failure returns this API's own
-/// `{"detail": "..."}` JSON shape (422) instead of axum's default rejection
-/// (400, plain text) — every error this API returns has the same shape.
+/// Like `axum::extract::Query`, but a parse failure is a 422 problem-details
+/// body instead of axum's default 400 plain-text rejection.
 struct Params<T>(T);
 
 impl<T, S> FromRequestParts<S> for Params<T>
@@ -288,9 +287,8 @@ where
 }
 
 /// `axum::extract::Path<String>`, but a rejection (in practice only
-/// undecodable percent-escapes in the path segment) comes back in this
-/// API's `{"detail": "..."}` shape as a 400 — malformed request syntax —
-/// instead of axum's plain-text default.
+/// undecodable percent-escapes) is a 400 problem-details body instead of
+/// axum's plain-text default.
 struct ImdbId(String);
 
 impl<S> FromRequestParts<S> for ImdbId
@@ -303,23 +301,6 @@ where
         match Path::<String>::from_request_parts(parts, state).await {
             Ok(Path(id)) => Ok(ImdbId(id)),
             Err(e) => Err(detail(StatusCode::BAD_REQUEST, &e.to_string())),
-        }
-    }
-}
-
-/// Normalizes a Response=True OMDB payload into the shape it's stored and
-/// served in, via the shared `util::normalize_omdb`. Returns the map on
-/// success, or a 502 `Response` (boxed to satisfy the signature) if OMDB
-/// sent something that isn't a JSON object.
-fn normalize_omdb_movie(movie: Value, rating: &str) -> Result<Map<String, Value>, Box<Response>> {
-    match movie {
-        Value::Object(obj) => Ok(normalize_omdb(obj, Value::String(rating.to_string()))),
-        _ => {
-            eprintln!("OMDB response was not a JSON object");
-            Err(Box::new(detail(
-                StatusCode::BAD_GATEWAY,
-                "OMDB response was not a JSON object",
-            )))
         }
     }
 }
@@ -407,8 +388,13 @@ async fn add_movie(State(state): State<Arc<AppState>>, Params(p): Params<AddPara
         // send() means the OMDB apikey ends up readable in journalctl.
         Err(e) => return internal_error(format!("OMDB request failed: {}", e.without_url())),
     };
-    let movie: Value = match resp.json().await {
-        Ok(v) => v,
+    let omdb = match resp.json::<Value>().await {
+        Ok(Value::Object(obj)) if obj.get("Response").and_then(Value::as_str) == Some("True") => {
+            obj
+        }
+        Ok(other) => {
+            return omdb_failure(other.get("Error").and_then(Value::as_str).unwrap_or(""), &p);
+        }
         Err(e) => {
             return internal_error(format!(
                 "OMDB response JSON parse failed: {}",
@@ -417,68 +403,55 @@ async fn add_movie(State(state): State<Arc<AppState>>, Params(p): Params<AddPara
         }
     };
 
-    if movie.get("Response").and_then(Value::as_str) == Some("True") {
-        let out = match normalize_omdb_movie(movie, &p.rating) {
-            Ok(out) => out,
-            Err(resp) => return *resp,
-        };
+    let now = utcnow();
+    let out = normalize_omdb(omdb, Value::String(p.rating), &now);
+    let Some(imdbid) = out.get("imdb_id").and_then(Value::as_str).map(String::from) else {
+        eprintln!("OMDB response missing imdbID");
+        return detail(StatusCode::BAD_GATEWAY, "OMDB response missing imdbID");
+    };
+    let Some(title) = out.get("title").and_then(Value::as_str).map(String::from) else {
+        eprintln!("OMDB response missing Title");
+        return detail(StatusCode::BAD_GATEWAY, "OMDB response missing Title");
+    };
+    // Owned: the write runs on a blocking-pool thread (see with_conn), which
+    // needs a 'static closure.
+    let ratings: Vec<Value> = out
+        .get("ratings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let data = match serde_json::to_string(&out) {
+        Ok(s) => s,
+        Err(e) => return internal_error(format!("failed to serialize movie doc: {e}")),
+    };
+    upsert_movie(&state, imdbid, title, ratings, data, now).await
+}
 
-        let Some(imdbid) = out.get("imdb_id").and_then(Value::as_str).map(String::from) else {
-            // OMDB violating its own contract (Response=True without an
-            // imdbID) — nothing sensible to persist or serve.
-            eprintln!("OMDB response missing imdbID");
-            return detail(StatusCode::BAD_GATEWAY, "OMDB response missing imdbID");
-        };
-        let Some(title) = out.get("title").and_then(Value::as_str).map(String::from) else {
-            eprintln!("OMDB response missing Title");
-            return detail(StatusCode::BAD_GATEWAY, "OMDB response missing Title");
-        };
-        // Owned, not borrowed: the write below runs on a blocking-pool thread
-        // (see with_conn), which needs a 'static closure — a &[Value] into
-        // `out` can't cross that boundary.
-        let ratings: Vec<Value> = out
-            .get("ratings")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
-        let now = utcnow();
-        let data = match serde_json::to_string(&out) {
-            Ok(s) => s,
-            Err(e) => return internal_error(format!("failed to serialize movie doc: {e}")),
-        };
-        return upsert_movie(&state, imdbid, title, ratings, data, now).await;
+/// Maps a Response=False OMDB payload's `Error` onto this API's answer.
+fn omdb_failure(error: &str, p: &AddParams) -> Response {
+    match classify_omdb_error(error) {
+        OmdbError::DailyLimit => {
+            // 503, not 429: the upstream's shared quota is spent, the caller
+            // isn't being rate-limited. OMDB doesn't document when its
+            // counter resets, so Retry-After is a conservative 24h.
+            let mut resp = problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                PROBLEM_OMDB_QUOTA,
+                "OMDB's daily request limit is exhausted; try again later",
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("86400"));
+            resp
+        }
+        OmdbError::NotFound => detail(StatusCode::NOT_FOUND, "Movie not found"),
+        OmdbError::Other => {
+            eprintln!(
+                "OMDB returned an unrecognized error for {} ({}): {error:?}",
+                p.title, p.year
+            );
+            detail(StatusCode::BAD_GATEWAY, "Unrecognized error from OMDB")
+        }
     }
-
-    let error = movie.get("Error").and_then(Value::as_str).unwrap_or("");
-    if error == "Daily request limit reached!" {
-        // Our own request rate isn't the problem — OMDB's shared daily quota
-        // is exhausted. 503 (not 429) is the correct signal for "this
-        // service's upstream dependency is temporarily unavailable, retry
-        // later", as opposed to "you personally are being rate-limited".
-        // Retry-After is a conservative fixed 24h; OMDB doesn't document
-        // exactly when its daily counter resets.
-        let mut resp = problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            PROBLEM_OMDB_QUOTA,
-            "OMDB's daily request limit is exhausted; try again later",
-        );
-        resp.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("86400"));
-        return resp;
-    }
-    if error == "Movie not found!" {
-        return detail(StatusCode::NOT_FOUND, "Movie not found");
-    }
-    eprintln!(
-        "OMDB returned an unrecognized error for {} ({}): {error}",
-        p.title, p.year
-    );
-    // 502: this server acted as a client to OMDB and got back an error it
-    // doesn't recognize — a Bad Gateway in the literal sense, and a real,
-    // standard HTTP status (unlike the Cloudflare-specific 520 this used to
-    // return).
-    detail(StatusCode::BAD_GATEWAY, "Unrecognized error from OMDB")
 }
 
 async fn list_movies(
@@ -488,10 +461,6 @@ async fn list_movies(
     with_conn(&state, move |conn| {
         let title = p.title.as_deref().filter(|s| !s.is_empty());
         let year = p.year.as_deref().filter(|s| !s.is_empty());
-        // A filter is just a narrower collection: several matches are all
-        // returned, zero matches is `[]` — with the non-unique (title, year)
-        // key, both are ordinary answers, not the 300/404 errors the old
-        // exactly-one /single lookup had to hand out.
         let (sql, filters) = match (title, year) {
             (None, None) => ("SELECT data FROM movies", vec![]),
             (Some(t), None) => ("SELECT data FROM movies WHERE title = ?", vec![t]),
@@ -651,10 +620,8 @@ async fn get_history(State(state): State<Arc<AppState>>, ImdbId(imdb_id): ImdbId
     .await
 }
 
-/// axum's built-in responses for an unmatched path (404) and a matched path
-/// with an unsupported method (405) have empty bodies — these two replace
-/// them so the `{"detail": ...}` contract holds on every error, not just the
-/// handler-level ones. axum still sets the `Allow` header on the 405.
+/// axum's own 404/405 have empty bodies; these keep the problem-details
+/// contract on every error. axum still sets `Allow` on the 405.
 async fn fallback_not_found() -> Response {
     detail(StatusCode::NOT_FOUND, "Not Found")
 }
@@ -679,23 +646,19 @@ async fn shutdown_signal() {
 }
 
 fn require_env(name: &str) -> String {
-    // Empty is as fatal as unset: an `API_KEY=` line in the env file would
-    // otherwise make check_key accept a blank x-api-key header (empty header
-    // values are legal HTTP), silently disabling auth.
-    match env::var(name) {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            eprintln!("{name} not set (or empty)");
-            exit(1);
-        }
-    }
+    // Empty is as fatal as unset: an `API_KEY=` line would otherwise make
+    // check_key accept a blank x-api-key header, silently disabling auth.
+    env_nonempty(name).unwrap_or_else(|| {
+        eprintln!("{name} not set (or empty)");
+        exit(1);
+    })
 }
 
 pub(crate) async fn serve(host: String, port: u16) {
     let api_key = require_env("API_KEY");
     let omdb_key = require_env("OMDB_KEY");
-    let db_path = env::var("DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
-    let omdb_url = env::var("OMDB_URL").unwrap_or_else(|_| DEFAULT_OMDB_URL.to_string());
+    let db_path = env_nonempty("DB_PATH").unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
+    let omdb_url = env_nonempty("OMDB_URL").unwrap_or_else(|| DEFAULT_OMDB_URL.to_string());
 
     let pool = match build_pool(&db_path) {
         Ok(p) => p,
