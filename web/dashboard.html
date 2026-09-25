@@ -3,81 +3,134 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>moviedb — ledger</title>
+<!-- Set the theme before the stylesheet is parsed, so a light-mode reader
+     never gets a frame of the dark ground. Same key and dark default as
+     hln.luhann.com and luhann.com; localStorage is per-origin, so the
+     choice is remembered per site rather than shared between them. -->
+<script>
+(function () {
+  var key = "theme_pref_v2";
+  var saved = localStorage.getItem(key);
+  document.documentElement.setAttribute(
+    "data-theme", saved === "light" || saved === "dark" ? saved : "dark");
+})();
+</script>
+<link rel="preload" href="fonts/EBGaramond-VariableFont_wght.woff2" as="font" type="font/woff2" crossorigin="anonymous">
+<link rel="preload" href="fonts/IBMPlexSans-VariableFont_wdth,wght.woff2" as="font" type="font/woff2" crossorigin="anonymous">
 <style>
+  /* Faces are served from this origin by the same Caddy file_server that
+     serves this page — no remote font import, so the dashboard needs no
+     font-src exception and leaks nothing to a CDN. Same three woff2 files
+     luhann.com self-hosts. */
+  @font-face { font-family: "EB Garamond"; src: url("fonts/EBGaramond-VariableFont_wght.woff2") format("woff2"); font-weight: 400 700; font-style: normal; font-display: swap; }
+  @font-face { font-family: "IBM Plex Sans"; src: url("fonts/IBMPlexSans-VariableFont_wdth,wght.woff2") format("woff2"); font-weight: 400 600; font-style: normal; font-display: swap; }
+  @font-face { font-family: "IBM Plex Mono"; src: url("fonts/IBMPlexMono-Regular.woff2") format("woff2"); font-weight: 400 500; font-style: normal; font-display: swap; }
+
+  /* Patroclus — hln.luhann.com's token block, plus the two values it has
+     no use for and this page does: accent_meta (the delta column's red on
+     paper) and derived.shadow (the tooltip and the picker's dropdown).
+     Both come from ~/dev/patroclus/design.yaml, so a diff against hln.css
+     should show those two lines and nothing else. Dark is the default there
+     and here; light is opt-in via data-theme, not the OS setting. Do not
+     hand-edit these values: change design.yaml, regenerate, re-copy. */
+  /* patroclus-tokens: begin */
+  :root,
+  [data-theme="dark"] {
+    --site-bg:           #000000;
+    --site-surface:      #0b0e12;
+    --site-surface-soft: #13171c;
+    --site-text:         #abb2b9;
+    --site-headline:     #f2efe9;
+    --site-muted:        #8f969d;
+    --site-accent:       #cf7d55;
+    --site-accent-cool:  #669ac5;
+    --site-accent-meta:  #a51c30;
+    --site-line:         #2e333b;
+    --site-code-bg:      #000000;
+    --site-shadow:       rgba(0, 0, 0, 0.5);
+    --font-serif:        'EB Garamond', Georgia, 'Times New Roman', serif;
+    --font-sans:         'IBM Plex Sans', Arial, sans-serif;
+    --font-mono:         'IBM Plex Mono', ui-monospace, 'SF Mono', 'Courier New', monospace;
+  }
+
+  [data-theme="light"] {
+    --site-bg:           #fbfaf7;
+    --site-surface:      #ffffff;
+    --site-surface-soft: #f1ede4;
+    --site-text:         #2c2a26;
+    --site-headline:     #16140f;
+    --site-muted:        #6b665d;
+    --site-accent:       #b5612f;
+    --site-accent-cool:  #2f6f9f;
+    --site-accent-meta:  #9a2233;
+    --site-line:         #ddd6c8;
+    --site-code-bg:      #f5f1e8;
+    --site-shadow:       rgba(101, 91, 82, 0.25);
+  }
+  /* patroclus-tokens: end */
+
+  /* This dashboard's roles, mapped onto those tokens. Every rule below
+     addresses a role, never a patroclus token directly, so re-pointing a
+     role is a one-line change here.
+
+     The three text weights take patroclus's three: data reads as the
+     emphasised layer (headline), prose and notes as body text, labels and
+     axis ticks as muted. */
   :root {
-    color-scheme: light;
-    --page:        #f9f9f7;
-    --surface:     #fcfcfb;
-    --ink:         #0b0b0b;
-    --ink-2:       #52514e;
-    --ink-muted:   #898781;
-    --grid:        #e1e0d9;
-    --baseline:    #c3c2b7;
-    --border:      rgba(11,11,11,0.10);
-    --border-2:    rgba(11,11,11,0.16);
-
-    --accent:      #2a78d6;   /* blue — "you" / sequential / personal series */
-    --accent-soft: rgba(42,120,214,0.12);
-    --imdb:        #eda100;   /* yellow */
-    --rt:          #e87ba4;   /* magenta */
-    --mc:          #008300;   /* green */
-    --diverge-neg: #e34948;   /* red — critics rated higher */
-    --diverge-mid: #f0efec;
-
-    --good:        #006300;
-    --critical:    #d03b3b;
-    --warning:     #fab219;
-
-    --font-display: ui-serif, "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
-    --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas, monospace;
-    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:where(:not([data-theme="light"])) {
-      color-scheme: dark;
-      --page:        #0d0d0d;
-      --surface:     #1a1a19;
-      --ink:         #ffffff;
-      --ink-2:       #c3c2b7;
-      --ink-muted:   #898781;
-      --grid:        #2c2c2a;
-      --baseline:    #383835;
-      --border:      rgba(255,255,255,0.10);
-      --border-2:    rgba(255,255,255,0.16);
-      --accent:      #3987e5;
-      --accent-soft: rgba(57,135,229,0.16);
-      --imdb:        #c98500;
-      --rt:          #d55181;
-      --mc:          #008300;
-      --diverge-neg: #e66767;
-      --diverge-mid: #383835;
-      --good:        #0ca30c;
-      --critical:    #d03b3b;
-      --warning:     #fab219;
-    }
-  }
-  :root[data-theme="dark"] {
     color-scheme: dark;
-    --page:        #0d0d0d;
-    --surface:     #1a1a19;
-    --ink:         #ffffff;
-    --ink-2:       #c3c2b7;
-    --ink-muted:   #898781;
-    --grid:        #2c2c2a;
-    --baseline:    #383835;
-    --border:      rgba(255,255,255,0.10);
-    --border-2:    rgba(255,255,255,0.16);
-    --accent:      #3987e5;
-    --accent-soft: rgba(57,135,229,0.16);
-    --imdb:        #c98500;
-    --rt:          #d55181;
-    --mc:          #008300;
-    --diverge-neg: #e66767;
-    --diverge-mid: #383835;
-    --good:        #0ca30c;
-    --critical:    #d03b3b;
-    --warning:     #fab219;
+    --page:        var(--site-bg);
+    --surface:     var(--site-surface);
+    --ink:         var(--site-headline);
+    --ink-2:       var(--site-text);
+    --ink-muted:   var(--site-muted);
+    --grid:        var(--site-line);
+    /* One step up from the gridlines: an axis baseline is a statement, a
+       gridline is scaffolding. Patroclus carries a single line colour, so
+       the step is mixed rather than invented. */
+    --baseline:    color-mix(in oklab, var(--site-line) 55%, var(--site-muted));
+    --border:      var(--site-line);
+    --border-2:    var(--site-line);
+    --rule-faint:  color-mix(in oklab, var(--site-surface) 78%, var(--site-line));
+
+    --font-display: var(--font-serif);
+
+    --accent:      var(--site-accent);
+    --accent-soft: color-mix(in oklab, var(--site-accent) 16%, transparent);
+
+    /* Series colours come from patroclus's desktop row (design.yaml
+       themes.screen.desktop.ansi), which is pitched at copper and steel's
+       lightness and chroma so a categorical set reads as one palette
+       instead of borrowed from another. Copper is "you"; the other three
+       keep each service's own hue family — ochre for IMDb's yellow, dusty
+       rose for Rotten Tomatoes, sage for Metacritic. */
+    --imdb:        #bf9932;   /* ochre */
+    --rt:          #c081aa;   /* dusty rose */
+    --mc:          #719e58;   /* sage */
+
+    /* Divergence is direction, not valence, so it takes the two accents
+       rather than a red/green pair: copper against steel separates further
+       by hue than copper against alizarin, which share a warm register. */
+    --diverge-neg: var(--site-accent-cool);
+    --diverge-mid: var(--site-surface-soft);
+
+    /* These three do carry valence. Patroclus has no green, so --good
+       borrows hln.css's site-level pair (its `--site-repo`), which was
+       picked as a companion to this palette for exactly this reason: the
+       ANSI sage is pitched for a dark terminal and goes thin as small text
+       on paper. */
+    --good:        #7ba05b;
+    --critical:    #d33949;   /* alizarin, lifted off black */
+    --warning:     #bf9932;   /* ochre */
+  }
+
+  [data-theme="light"] {
+    color-scheme: light;
+    /* On paper the lifted red is unnecessary — alizarin proper is the
+       palette's own meta accent and reads better against warm white. */
+    --critical:    var(--site-accent-meta);
+    --good:        #4a7233;
   }
 
   * { box-sizing: border-box; }
@@ -86,7 +139,27 @@
     background: var(--page);
     color: var(--ink);
     font-family: var(--font-sans);
+    font-feature-settings: "liga" 1, "onum" 1, "kern" 1;
     -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Old-style figures are what give the serif its voice in a heading like
+     "Marley & Me (2008)", but they are wrong wherever digits have to line
+     up in a column. Everything numeric asks for lining, tabular figures
+     instead — font-feature-settings would otherwise win over the
+     font-variant-numeric these rules already set. */
+  .stat-tile .value,
+  table.ledger td.num, table.ledger th.num,
+  .meter .m-raw,
+  .axis-tick, .bar-label,
+  svg text {
+    font-feature-settings: "liga" 1, "lnum" 1, "tnum" 1, "kern" 1;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--site-accent) 28%, transparent);
+    color: var(--site-headline);
   }
   .wrap {
     max-width: 1180px;
@@ -112,12 +185,13 @@
     flex-wrap: wrap;
     gap: 12px;
     padding-bottom: 18px;
-    border-bottom: 2px solid var(--ink);
+    border-bottom: 1px solid var(--site-line);
   }
   .wordmark { display: flex; align-items: baseline; gap: 14px; }
   .wordmark h1 {
     font-family: var(--font-display);
-    font-weight: 600;
+    color: var(--site-headline);
+    font-weight: 500;
     font-size: 30px;
     letter-spacing: 0.01em;
     margin: 0;
@@ -155,7 +229,37 @@
     cursor: pointer;
     margin-top: 4px;
   }
-  .meta-stamp button:hover { color: var(--ink); border-color: var(--ink-muted); }
+  .meta-stamp button:hover { color: var(--ink); border-color: var(--site-accent); }
+
+  .meta-stamp .stamp-actions {
+    display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+  }
+
+  /* hln.luhann.com's toggle, same shape and same sun/moon swap. Scoped to
+     the masthead so it outranks `.meta-stamp button` above, which would
+     otherwise square off the pill and re-pad it. */
+  .meta-stamp .theme-toggle {
+    align-items: center;
+    background: var(--site-surface);
+    border: 1px solid var(--site-line);
+    border-radius: 999px;
+    color: var(--site-muted);
+    cursor: pointer;
+    display: inline-flex;
+    height: 1.75rem;
+    width: 1.75rem;
+    justify-content: center;
+    padding: 0;
+    margin-top: 4px;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .meta-stamp .theme-toggle:hover,
+  .meta-stamp .theme-toggle:focus-visible { border-color: var(--site-accent); color: var(--site-headline); }
+
+  .theme-icon { fill: currentColor; height: 0.85rem; width: 0.85rem; }
+  .theme-icon-moon { display: none; }
+  [data-theme="light"] .theme-icon-sun  { display: none; }
+  [data-theme="light"] .theme-icon-moon { display: block; }
 
   /* ---------- stat tiles ---------- */
   .stat-row {
@@ -164,12 +268,14 @@
     gap: 1px;
     background: var(--border);
     border: 1px solid var(--border);
+    border-radius: 3px;
+    overflow: hidden;
   }
   .stat-tile {
     background: var(--surface);
     padding: 18px 20px;
     background-image: repeating-linear-gradient(
-      to bottom, transparent, transparent 20px, var(--border) 20px, var(--border) 21px
+      to bottom, transparent, transparent 20px, var(--rule-faint) 20px, var(--rule-faint) 21px
     );
     background-position: 0 44px;
   }
@@ -203,13 +309,19 @@
      on a narrow viewport. Same root cause as the .wrap > * rule above. */
   .grid-2 { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr); gap: 20px; }
   .grid-2b { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
-  .panel { background: var(--surface); border: 1px solid var(--border); padding: 20px 22px 18px; min-width: 0; }
+  .panel {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 3px; padding: 20px 22px 18px; min-width: 0;
+  }
   .panel-head {
     display: flex; justify-content: space-between; align-items: flex-start;
     gap: 12px; margin-bottom: 4px; min-width: 0;
   }
   .panel-head > div:first-child { min-width: 0; }
-  .panel-head h2 { font-family: var(--font-display); font-size: 17px; font-weight: 600; margin: 0; }
+  .panel-head h2 {
+    font-family: var(--font-display); font-size: 18px; font-weight: 500;
+    color: var(--site-headline); margin: 0; letter-spacing: 0.01em;
+  }
   .panel-head .note { font-family: var(--font-sans); font-size: 12px; color: var(--ink-2); margin: 3px 0 0; max-width: 46ch; }
   .panel-head .index {
     font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-muted);
@@ -248,7 +360,7 @@
     background: var(--surface);
     border: 1px solid var(--border-2);
     border-radius: 3px;
-    box-shadow: 0 10px 28px rgba(0,0,0,0.16);
+    box-shadow: 0 10px 28px var(--site-shadow);
   }
   .combo-option {
     font-family: var(--font-sans); font-size: 12.5px; color: var(--ink);
@@ -300,7 +412,7 @@
     transition: opacity 0.08s ease;
     z-index: 50;
     white-space: nowrap;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    box-shadow: 0 4px 14px var(--site-shadow);
   }
   #tooltip.show { opacity: 1; }
   #tooltip b { font-weight: 700; }
@@ -331,8 +443,8 @@
     font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.04em;
     padding: 2px 6px; border-radius: 3px; border: 1px solid var(--border-2); color: var(--ink-muted);
   }
-  .chip.stale { color: var(--warning); border-color: var(--warning); }
-  .chip.stale::before { content: "●"; font-size: 8px; }
+  .chip.stale { color: var(--ink-2); border-color: var(--warning); }
+  .chip.stale::before { content: "●"; font-size: 8px; color: var(--warning); }
 
   footer.foot {
     font-family: var(--font-mono); font-size: 11px; color: var(--ink-muted);
@@ -361,7 +473,7 @@
   }
   .key-card button {
     font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.03em;
-    background: var(--accent); color: white; border: none;
+    background: var(--accent); color: var(--site-bg); border: none;
     padding: 9px 14px; border-radius: 3px; cursor: pointer; width: 100%;
   }
   .key-card .err { color: var(--critical); font-size: 12px; font-family: var(--font-sans); margin: 8px 0 0; min-height: 1em; }
@@ -403,7 +515,7 @@
     font-size: 12px;
     letter-spacing: 0.03em;
     background: var(--accent);
-    color: white;
+    color: var(--site-bg);
     border: none;
     padding: 9px 16px;
     border-radius: 3px;
@@ -442,16 +554,16 @@
   }
   .detail-body { min-width: 0; }
   .detail-body h3 {
-    font-family: var(--font-display); font-size: 22px; font-weight: 600;
-    margin: 0; text-wrap: balance;
+    font-family: var(--font-display); font-size: 24px; font-weight: 500;
+    color: var(--site-headline); margin: 0; text-wrap: balance;
   }
   .detail-body .sub-line {
     font-family: var(--font-mono); font-size: 11.5px;
     letter-spacing: 0.03em; color: var(--ink-muted); margin-top: 5px;
   }
   .detail-body .plot {
-    font-size: 13.5px; line-height: 1.65; color: var(--ink-2);
-    margin: 14px 0 0; max-width: 70ch;
+    font-family: var(--font-serif); font-size: 16px; line-height: 1.62;
+    color: var(--ink-2); margin: 14px 0 0; max-width: 66ch;
   }
   .meters {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -505,7 +617,13 @@
     </div>
     <div class="meta-stamp">
       <div><span class="dot"></span><span id="statusLine">connecting…</span></div>
-      <button id="forgetKeyBtn" type="button">forget key</button>
+      <div class="stamp-actions">
+        <button id="forgetKeyBtn" type="button">forget key</button>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch to light mode">
+          <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0 2a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0v-2a1 1 0 0 1 1-1zm0-17a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0V3a1 1 0 0 1 1-1zm10 9a1 1 0 0 1 0 2h-2a1 1 0 1 1 0-2h2zM4 11a1 1 0 1 1 0 2H2a1 1 0 1 1 0-2h2zm13.657 6.243 1.414 1.414a1 1 0 0 1-1.414 1.414l-1.414-1.414a1 1 0 1 1 1.414-1.414zm-11.314 0a1 1 0 0 1 1.414 1.414L6.343 20.07a1 1 0 1 1-1.414-1.414l1.414-1.414zm11.314-10.486a1 1 0 0 1-1.414-1.414l1.414-1.414a1 1 0 0 1 1.414 1.414l-1.414 1.414zM6.343 6.757 4.93 5.343a1 1 0 0 1 1.414-1.414l1.414 1.414a1 1 0 1 1-1.414 1.414z"/></svg>
+          <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.742 13.045A8.088 8.088 0 0 1 10.955 3.26a1 1 0 0 0-1.21-1.21A10.09 10.09 0 1 0 21.95 14.255a1 1 0 0 0-1.208-1.21z"/></svg>
+        </button>
+      </div>
     </div>
   </header>
 
@@ -920,6 +1038,26 @@
     hideKeyPrompt();
     boot();
   }
+  // Charts read their colours as live var() references in SVG presentation
+  // attributes, so flipping data-theme re-paints every plot without a
+  // re-render or a re-fetch.
+  (function () {
+    const key = "theme_pref_v2";
+    const root = document.documentElement;
+    const btn = document.getElementById("theme-toggle");
+    const updateLabel = () => {
+      const theme = root.getAttribute("data-theme") || "dark";
+      btn.setAttribute("aria-label", theme === "dark" ? "Switch to light mode" : "Switch to dark mode");
+    };
+    btn.addEventListener("click", () => {
+      const next = (root.getAttribute("data-theme") || "dark") === "dark" ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      localStorage.setItem(key, next);
+      updateLabel();
+    });
+    updateLabel();
+  })();
+
   document.getElementById("forgetKeyBtn").addEventListener("click", () => {
     localStorage.removeItem(KEY_STORAGE);
     showKeyPrompt("");
