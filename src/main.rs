@@ -1,34 +1,31 @@
-//! moviedb
+//! moviedb: a self-hosted movie rating API.
 //!
-//! Self-hosted movie rating API. Single binary: `serve` (the API)
-//! and `refresh` (re-pull OMDB data, cron-able). Originally a set of AWS
-//! Lambdas, then I migrated to a `FastAPI` service; this Rust binary is what replaced both.
+//! One binary with two subcommands: `serve` runs the API and `refresh`
+//! re-fetches OMDB data for every stored movie. This started as a set of AWS
+//! Lambdas, then became a `FastAPI` service, and this replaces both.
 //!
-//! See `http.rs` for the endpoint list and error shape, `refresh.rs` for the
-//! refresh job, `db.rs` for the SQLite schema/connection setup shared by
-//! both, and `util.rs` for the handful of helpers/defaults they both need.
+//! - `http.rs`: the endpoints and error format
+//! - `refresh.rs`: the refresh job
+//! - `db.rs`: SQLite schema and connection setup
+//! - `util.rs`: helpers both of them use
 
 mod db;
 mod http;
 mod refresh;
 mod util;
 
-use std::process::{ExitCode, exit};
+use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use db::DB_POOL_SIZE;
-use util::env_nonempty;
-
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-// Headroom above DB_POOL_SIZE for non-DB blocking work. At most DB_POOL_SIZE blocking
-// threads ever do DB work, so this headroom stays free for DNS. POST /movies is
-// the only handler that resolves DNS, so 4 is generous, and total threads
-// (workers + blocking pool) must stay comfortably under the unit's TasksMax=32.
-const BLOCKING_POOL_HEADROOM: usize = 4;
+// One blocking thread runs database work at a time; the rest are for DNS
+// lookups when calling OMDB. tokio's default is 512, and the unit's
+// TasksMax=32 has to cover these plus the worker threads.
+const MAX_BLOCKING_THREADS: usize = 4;
 
 #[derive(Parser)]
 #[command(name = "moviedb", version)]
@@ -48,7 +45,8 @@ enum Command {
     },
     /// Re-pull OMDB data for all movies, preserving Personal ratings
     Refresh {
-        /// SQLite database path (falls back to $`DB_PATH`)
+        /// SQLite database path (defaults to $`DB_PATH`, then
+        /// /var/lib/moviedb/movies.db)
         db_path: Option<String>,
         /// Only process the N oldest-refreshed movies
         #[arg(long)]
@@ -70,14 +68,10 @@ fn parse_seconds(s: &str) -> Result<Duration, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Every DB-touching handler runs its query on a spawn_blocking thread,
-    // admitted by with_conn's DB_POOL_SIZE-permit semaphore — but tokio's
-    // *blocking thread pool itself* defaults to a cap of 512, independent of
-    // DB_POOL_SIZE.
     tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .enable_time()
-        .max_blocking_threads(DB_POOL_SIZE as usize + BLOCKING_POOL_HEADROOM)
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
         .build()
         .expect("failed to build tokio runtime")
         .block_on(async {
@@ -92,13 +86,7 @@ fn main() -> ExitCode {
                     sleep,
                     dry_run,
                 } => {
-                    let db_path =
-                        db_path
-                            .or_else(|| env_nonempty("DB_PATH"))
-                            .unwrap_or_else(|| {
-                                eprintln!("moviedb refresh: no db_path given and DB_PATH not set");
-                                exit(2);
-                            });
+                    let db_path = db_path.unwrap_or_else(util::db_path);
                     refresh::refresh(db_path, limit, sleep, dry_run).await
                 }
             }

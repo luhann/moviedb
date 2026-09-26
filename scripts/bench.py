@@ -1,68 +1,14 @@
 #!/usr/bin/env python3
 """Throughput benchmark for moviedb's GET endpoints. Stdlib only.
 
-Deliberately excludes POST /movies — that path is bound by OMDB's own rate
-limit, not by anything moviedb's server does, so hammering it measures OMDB,
-not this codebase.
-
-The load generator is multi-process, not just multi-threaded, and that is the
-whole reason this file is shaped the way it is. A single CPython process is
-GIL-bound well below what the server can serve: measured against a local
-instance returning a 195KB list body, one process plateaus at ~2.5k req/s no
-matter how many threads it runs, while four processes reach ~8.9k and eight
-reach ~16.5k against that same server. A threads-only client therefore reports
-the *client's* ceiling and calls it the server's — and it does so in a
-convincing shape, with throughput peaking around concurrency 2 and sagging
-after, which reads exactly like server-side contention. `--concurrency` here is
-always the TOTAL connection count; it is split across processes so the client
-stays out of the way. The split is printed with every row so a client-bound
-result stays visible instead of being silently absorbed.
-
-What the measurements actually showed (prod, 184 movies, 200KB list body):
-  - DB_POOL_SIZE=8 is not the limiting factor for anything. Point lookups run
-    ~10us in SQLite, so 8 pooled connections sustain ~11k req/s end-to-end;
-    the pool never becomes the queue.
-  - GET /movies is bound by per-request server cost, not bandwidth. Caddy
-    already negotiates zstd/br/gzip (200KB -> ~46-53KB on the wire), and
-    asking for compression does not raise throughput — it moves ~530 req/s to
-    ~480. A 4x smaller body buying nothing is what rules bandwidth out, so
-    --accept-encoding exists to let you re-check that rather than assume it.
-  - GET /movies/recent is the costliest path per row: 50 rows through it
-    (~359 req/s) is slower than all 184 movies through GET /movies
-    (~530 req/s). The correlated MAX(observed) subquery and the per-doc
-    splice dominate, so vary --path over ?limit= to see it.
-
-GET /movies still collects the whole table per in-flight request
-(list_movies: `rows.collect()`), and the resulting memory curve is worth
-measuring rather than deriving — the arithmetic understates it badly. Measured
-against systemd's MemoryMax=256M, from a 15MB never-served idle baseline:
-
-    184 rows  (200KB body)   conc 64   ->  83MB peak   (+68MB)
-    2000 rows (2.9MB body)   conc 64   -> 151MB peak  (+136MB)
-
-Two things that only show up on a real run. First, growth plateaus from
-concurrency 8 (39/105/118/136/136 MB at conc 4/8/16/32/64 on the 2000-row
-table): DB_POOL_SIZE caps how many whole-table copies are ever live at once,
-so pushing concurrency past the pool costs no further memory. Second, the
-plateau still lands far above the live set, because peak RSS includes
-allocator retention rather than just what is in flight — which is why a
-"~8x the table" estimate is off by roughly a factor of six.
-
-Growth is also not linear in table size (10x the rows only doubled it), most
-of it being fixed per-connection and allocator overhead. Extrapolating the two
-points above puts the cap somewhere near 5k rows. Sample RSS while you sweep
-if you want the real number for a given table:
-    while :; do awk '/VmRSS/{print $2}' /proc/$(pgrep -x moviedb)/status; sleep 0.2; done
-
-Take the measure-first point generally: an earlier pass at this file reported
-RSS as flat under load, having read its "idle" baseline off a server that had
-already served the ladder, so it was reading retained memory as the floor.
+POST /movies is left out on purpose. Its speed depends on OMDB's rate limit,
+so benchmarking it would measure OMDB rather than moviedb.
 
 Two subcommands:
-  seed  write N synthetic rows directly into a SQLite file, bypassing OMDB
-        entirely, so table size is controllable and repeatable.
-  run   hammer a running instance at increasing concurrency levels and
-        report req/s, goodput, and latency percentiles.
+  seed  write N synthetic rows straight into a SQLite file, without OMDB,
+        so the table size is under your control and repeatable.
+  run   load a running instance at increasing concurrency and report
+        req/s, goodput and latency percentiles.
 
 Usage:
     python3 scripts/bench.py seed --db /tmp/bench.db --rows 5000
@@ -73,23 +19,87 @@ Usage:
     python3 scripts/bench.py run --url http://127.0.0.1:8123 --key bench \\
         --path /movies --concurrency 1,2,4,8,16,32,64 --duration 5
 
-    # compare against the point-lookup path to separate per-request server
-    # cost from anything proportional to the response body:
+    # compare with a single-movie lookup to separate the fixed cost of a
+    # request from the cost of a large response body:
     python3 scripts/bench.py run --url http://127.0.0.1:8123 --key bench \\
         --path /movies/tt0000000 --concurrency 1,2,4,8,16,32,64 --duration 5
 
-    # and re-check the bandwidth question on any new body size:
+    # check whether compression helps at a given body size:
     python3 scripts/bench.py run --url https://omdb.luhann.com --key "$KEY" \\
         --path /movies --accept-encoding 'zstd, br, gzip' --concurrency 8
 
-Watch memory on the box being tested while this runs — this script doesn't
-sample it remotely:
+This script doesn't watch the server's memory. Do that on the server while
+it runs:
     systemctl show moviedb -p MemoryCurrent
     journalctl -u moviedb -f
 
-Run a large --rows sweep against a scratch DB/instance rather than the live
-service: that is the configuration that can still find an OOM, and the live
-service has no headroom to spare (MemoryMax=256M).
+Run large --rows sweeps against a scratch database and instance, not the
+live service. That's where you might hit an out-of-memory kill, and the live
+service has little room to spare (MemoryMax=256M).
+
+
+Why the client uses several processes
+-------------------------------------
+One Python process can't send requests fast enough to load the server,
+because of the GIL. Against a local instance serving a 195KB list, one
+process tops out around 2.5k req/s however many threads it has. Four
+processes reach about 8.9k and eight about 16.5k against the same server.
+
+A threads-only client therefore measures itself, and the results look
+convincingly like server contention: throughput peaks around concurrency 2
+and then drops. So `--concurrency` is always the total number of
+connections, spread across processes. Each result row prints the split so
+you can spot a client-bound result.
+
+
+Results so far
+--------------
+Measured on prod with 2.x (184 movies, 200KB list body, 8 pooled
+connections):
+- GET /movies is limited by per-request work on the server, not bandwidth.
+  Caddy already compresses responses (200KB becomes about 46-53KB), and
+  asking for compression doesn't help: throughput goes from about 530 to 480
+  req/s. A body 4x smaller that isn't any faster rules bandwidth out.
+  --accept-encoding is there so you can check this again.
+
+3.0 replaced the pool with one connection. Measured locally on 2026-09-26,
+server pinned to 2 cores, same 184 seeded rows, req/s at concurrency 1/8/32:
+
+    GET /movies            pool  4.7k / 16.2k / 15.0k    one  5.0k / 12.4k / 12.8k
+    GET /movies/tt0000001  pool  8.7k / 53.5k / 65.3k    one  9.0k / 48.4k / 50.1k
+
+So one connection costs about 20% at high concurrency and nothing for a
+single client, which is the only load this service sees.
+
+
+Memory
+------
+GET /movies builds the whole response in memory for each request in
+flight. Measure the effect rather than working it out, because the
+arithmetic comes out far too low. Against MemoryMax=256M, starting from an
+idle baseline of 15MB (on a server that hadn't served anything yet):
+
+    184 rows  (200KB body)   conc 64   ->  83MB peak   (+68MB)
+    2000 rows (2.9MB body)   conc 64   -> 151MB peak  (+136MB)
+
+These were measured with the 8-connection pool in 2.x. Memory stopped
+growing from concurrency 8 onwards (39/105/118/136/136 MB at 4/8/16/32/64 on
+the 2000-row table), because only 8 requests could build a response at once.
+With one connection only one builds at a time, so expect lower peaks; this
+hasn't been re-measured. The peak was still well above what was actually in
+use, because RSS includes memory the allocator keeps hold of. That's why a
+guess of "about 8x the table" was out by about a factor of six.
+
+Growth isn't linear in table size either: 10x the rows only doubled it,
+because most of it is fixed per-connection and allocator overhead. From the
+two points above, the limit is somewhere around 5k rows. To get the real
+number for a given table, sample RSS while you run the sweep:
+    while :; do awk '/VmRSS/{print $2}' /proc/$(pgrep -x moviedb)/status; sleep 0.2; done
+
+Take the baseline from a freshly started server. An earlier version of this
+note said memory stayed flat under load, because its "idle" reading came
+from a server that had already been benchmarked and was still holding on to
+that memory.
 """
 import argparse
 import http.client
@@ -106,23 +116,26 @@ from urllib.parse import urlsplit
 
 def seed(args):
     conn = sqlite3.connect(args.db)
-    conn.execute("""
+    # Must match TABLES and INDEXES in src/db.rs.
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS movies (
-            imdb_id TEXT PRIMARY KEY,
-            data    JSON NOT NULL,
-            title   TEXT GENERATED ALWAYS AS (json_extract(data, '$.title')) VIRTUAL,
-            year    TEXT GENERATED ALWAYS AS (json_extract(data, '$.year'))  VIRTUAL
-        )
-    """)  # must match init_db in src/db.rs
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_movies_title_year ON movies (title, year)")
+            imdb_id   TEXT PRIMARY KEY,
+            data      JSON NOT NULL,
+            personal  INTEGER NOT NULL CHECK (personal BETWEEN 0 AND 100),
+            refreshed TEXT NOT NULL,
+            title     TEXT GENERATED ALWAYS AS (json_extract(data, '$.title')) VIRTUAL,
+            year      TEXT GENERATED ALWAYS AS (json_extract(data, '$.year'))  VIRTUAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_movies_title_year ON movies (title, year);
+        CREATE INDEX IF NOT EXISTS idx_movies_year ON movies (year);
+        CREATE INDEX IF NOT EXISTS idx_movies_refreshed ON movies (refreshed, imdb_id);
+    """)
 
     rng = random.Random(args.seed)
     rows = []
     for i in range(args.rows):
         imdb_id = f"tt{i:07d}"
-        # ~1.2KB doc, roughly matching a real OMDB payload, so total table
-        # size scales predictably with --rows.
+        # About 1.2KB, similar to a real OMDB doc.
         doc = {
             "title": f"Synthetic Movie {i}", "year": str(1950 + i % 75),
             "rated": "PG-13", "released": "01 Jan 2000", "runtime": "120 min",
@@ -137,30 +150,29 @@ def seed(args):
             "ratings": [
                 {"source": "Internet Movie Database", "value": "7.1/10"},
                 {"source": "Rotten Tomatoes", "value": "70%"},
-                {"source": "Personal", "value": "8/10"},
             ],
         }
-        rows.append((imdb_id, json.dumps(doc)))
+        refreshed = f"2026-01-01T00:00:{i % 60:02d}.{i % 1000:03d}+00:00"
+        rows.append((imdb_id, json.dumps(doc), 80, refreshed))
     conn.executemany(
-        "INSERT OR REPLACE INTO movies (imdb_id, data) VALUES (?, ?)", rows)
+        "INSERT OR REPLACE INTO movies (imdb_id, data, personal, refreshed)"
+        " VALUES (?, ?, ?, ?)", rows)
     conn.commit()
     conn.close()
     print(f"seeded {args.rows} rows into {args.db}")
 
 
 class Worker(threading.Thread):
-    """One persistent HTTP/1.1 connection per thread, reused across requests
-    — avoids TCP/TLS handshake cost confounding the throughput number."""
+    """One HTTP/1.1 connection per thread, reused for every request so
+    connection setup doesn't skew the numbers."""
 
     def __init__(self, host, port, use_ssl, path, key, encoding, start_at, duration):
         super().__init__()
         self.host, self.port, self.use_ssl = host, port, use_ssl
         self.path, self.key, self.encoding = path, key, encoding
         self.start_at, self.duration = start_at, duration
-        # All per-worker, summed after join. Threads within one process could
-        # share a list (append is atomic), but processes can't share anything
-        # without pickling it back, so every worker owns its own totals and
-        # the aggregation happens once, in the parent.
+        # Each worker keeps its own totals, since processes can't share
+        # them. The parent adds them up at the end.
         self.latencies_ms = []
         self.errors = 0
         self.count = 0
@@ -181,14 +193,12 @@ class Worker(threading.Thread):
         except Exception:
             conn = None
 
-        # Connect first, then wait: the handshake is paid before the measured
-        # window, and every worker in every process unblocks at the same
-        # wall-clock instant. Without this, high concurrency levels open N TLS
-        # connections *during* the run and charge the resulting handshake
-        # storm to the server's p99. time.time() rather than time.monotonic()
-        # because monotonic epochs are only comparable across processes on
-        # some platforms; over a sub-second barrier, wall-clock skew is a
-        # non-issue.
+        # Connect first, then wait for the shared start time. That keeps TLS
+        # handshakes out of the measurement, and every worker starts at the
+        # same moment. Without it, a high concurrency run would count dozens
+        # of handshakes against the server's p99. time.time() is used
+        # because monotonic clocks can't always be compared between
+        # processes.
         delay = self.start_at - time.time()
         if delay > 0:
             time.sleep(delay)
@@ -211,9 +221,8 @@ class Worker(threading.Thread):
                     self.errors += 1
                 else:
                     self.latencies_ms.append((time.monotonic() - t0) * 1000)
-                    # Wire bytes, so this stays the compressed size when
-                    # --accept-encoding is in play. That's the number the
-                    # bandwidth question needs.
+                    # Bytes as sent, so compressed when --accept-encoding
+                    # is used.
                     self.bytes += len(body)
                     self.count += 1
             except Exception:
@@ -226,7 +235,7 @@ class Worker(threading.Thread):
 
 
 def _run_child(payload):
-    """One client process: run `threads` workers and hand totals back up."""
+    """One client process: run `threads` workers and return their totals."""
     threads, host, port, use_ssl, path, key, encoding, start_at, duration = payload
     workers = [
         Worker(host, port, use_ssl, path, key, encoding, start_at, duration)
@@ -247,10 +256,9 @@ def _run_child(payload):
 def split_concurrency(total, max_procs):
     """Spread `total` connections over as many processes as cores allow.
 
-    One process per connection until cores run out, because a process with one
-    connection can never be the GIL bottleneck. Remainder threads land on the
-    lowest-indexed processes, so 64 connections over 32 cores is 32x2 rather
-    than a lopsided split that would make some processes saturate first.
+    One process per connection until the cores run out, so the GIL is never
+    the bottleneck. After that, connections are spread evenly: 64 over 32
+    cores is 2 each.
     """
     procs = max(1, min(total, max_procs))
     base, extra = divmod(total, procs)
@@ -264,9 +272,8 @@ def run_at_concurrency(url, path, key, encoding, total_conc, duration, max_procs
     use_ssl = parts.scheme == "https"
     splits = split_concurrency(total_conc, max_procs)
 
-    # Enough slack for every child to fork, import, and finish its handshakes
-    # before the barrier lifts. Scales with process count because forking 32
-    # interpreters costs more than forking 2.
+    # Give every process time to start and connect before the run begins.
+    # More processes need longer.
     start_at = time.time() + 0.75 + 0.05 * len(splits)
     payloads = [
         (t, host, port, use_ssl, path, key, encoding, start_at, duration)
@@ -283,9 +290,8 @@ def run_at_concurrency(url, path, key, encoding, total_conc, duration, max_procs
     errors = sum(r["errors"] for r in results)
     nbytes = sum(r["bytes"] for r in results)
     latencies = [ms for r in results for ms in r["latencies"]]
-    # `duration` is the denominator rather than a measured elapsed: the barrier
-    # makes every worker's window that long by construction, and a measured
-    # span would fold each child's fork and join overhead into the rate.
+    # Divide by `duration` rather than a measured time. Every worker runs for
+    # exactly that long, and a measured time would include process startup.
     return total, duration, latencies, errors, nbytes, len(splits)
 
 

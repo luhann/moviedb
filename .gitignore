@@ -4,19 +4,18 @@
 # rustfmt backup files
 *.rs.bk
 
-# Local SQLite databases (WAL mode also creates -shm/-wal sidecars)
+# Local SQLite databases, plus the -shm/-wal files WAL mode creates
 *.db
 *.db-shm
 *.db-wal
 
-# Secrets — dist/moviedb.env.example is a template, not a real credential
+# Secrets (dist/moviedb.env.example is only a template)
 *.env
 
-# scripts/migrate_dynamo.py and tests/smoke_test.py are stdlib-only, but
-# harmless to guard against anyway
+# Python caches from the test and bench scripts
 __pycache__/
 
-# tests/fuzz_test.py — schemathesis' cache of previously-found examples
+# schemathesis' cache of examples it has found (tests/fuzz_test.py)
 .schemathesis/
 
 .vscode/

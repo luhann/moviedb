@@ -4,33 +4,32 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# exec (not simple): `systemctl start` fails synchronously if the execve
-# fails — a missing binary or stripped exec bit (pct push without --perms)
-# surfaces immediately instead of as an async 203 in the journal
+# With Type=exec, `systemctl start` itself fails if the binary is missing or
+# not executable (e.g. pct push without --perms), instead of the error only
+# showing up later in the journal as a 203.
 Type=exec
-# Ephemeral UID per start; no passwd entry to target. User= names the
-# allocation so moviedb-refresh.service shares the same UID when it runs
-# concurrently — required for both to touch the same StateDirectory.
-# The static `moviedb` user must NOT exist (userdel moviedb).
+# A throwaway UID for each start. User= names it so moviedb-refresh.service
+# gets the same UID when both run at once, which they need to share the
+# StateDirectory. There must be no real `moviedb` user (userdel moviedb).
 DynamicUser=true
 User=moviedb
-# /var/lib/private/moviedb, symlinked at /var/lib/moviedb; ownership is
-# fixed up recursively at every start, so DB_PATH stays unchanged.
+# Lives in /var/lib/private/moviedb with a symlink at /var/lib/moviedb, so
+# DB_PATH doesn't change. systemd fixes ownership on every start.
 StateDirectory=moviedb
 EnvironmentFile=/etc/moviedb.env
 ExecStart=/opt/moviedb/moviedb serve --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5
 
-# Hardening — service only needs to write its own DB directory.
-# Verify the score with: systemd-analyze security moviedb
+# Hardening. The service only needs to write its own database directory.
+# Check the score with: systemd-analyze security moviedb
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
 PrivateMounts=true
-# Static binary, no interpreter — these would break CPython but not this
+# Fine for a static binary (these would break an interpreter like Python)
 MemoryDenyWriteExecute=true
 NoExecPaths=/
 ExecPaths=/opt/moviedb/moviedb
@@ -50,16 +49,16 @@ LockPersonality=true
 KeyringMode=private
 CapabilityBoundingSet=
 UMask=0077
-# DB writes + one outbound HTTPS call per POST: tiny resource envelope,
-# so cap it — a compromised process can't fork-bomb or balloon the host
+# The service needs very little, so cap it. A compromised process can't
+# fork-bomb or eat the host's memory.
 TasksMax=32
 MemoryMax=256M
-# Only bind the service port (best-effort: needs BPF delegation, may no-op
-# in an unprivileged LXC — check systemd-analyze security output)
+# Only allow binding the service port. This needs BPF delegation and may do
+# nothing in an unprivileged LXC; check systemd-analyze security.
 SocketBindDeny=any
 SocketBindAllow=tcp:8000
-# The next two are the usual 226/NAMESPACE suspects in unprivileged LXCs.
-# Enable one at a time; drop whichever breaks startup.
+# These tend to cause 226/NAMESPACE failures in unprivileged LXCs. Try them
+# one at a time and drop any that stop the service starting.
 #ProtectProc=invisible
 #ProcSubset=pid
 #PrivateUsers=true

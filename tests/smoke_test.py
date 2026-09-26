@@ -1,11 +1,10 @@
 """End-to-end test for the moviedb binary. Stdlib only.
 
-Runs the real binary against a stub OMDB server and a temp DB: the full
-endpoint matrix (auth, POST /movies, GET /movies with and without filters,
-GET /movies/recent, GET /movies/{imdb_id}, GET /movies/{imdb_id}/history,
-error paths incl. the problem+json contract on unmatched paths/methods)
-plus refresh edge cases (null Personal rating, OMDB response missing Title,
-a re-rate landing mid-run, rejected key, quota, transient OMDB failures).
+Runs the real binary against a fake OMDB server and a temporary database.
+Covers every endpoint, auth, the error responses (including unknown paths
+and wrong methods), and the awkward refresh cases: an OMDB response with no
+Title, a re-rate during a run, a rejected key, running out of quota, and
+OMDB failing.
 
 Usage:
     python3 tests/smoke_test.py [path-to-binary]
@@ -44,20 +43,14 @@ OMDB_DOC = {
     "Response": "True",
 }
 
-# Set in main(): the stub re-rates a movie mid-refresh through it.
+# Set in main(). The fake OMDB uses it to re-rate a movie mid-refresh.
 STUB_DB = None
 
 
 def rerate_mid_run(imdb_id, value):
-    """What a POST /movies landing during a refresh run does to the row."""
+    """Changes a movie's rating the way a POST during a refresh would."""
     con = sqlite3.connect(STUB_DB)
-    doc = json.loads(
-        con.execute("SELECT data FROM movies WHERE imdb_id = ?", (imdb_id,)).fetchone()[0]
-    )
-    doc["ratings"][-1]["value"] = value
-    con.execute(
-        "UPDATE movies SET data = ? WHERE imdb_id = ?", (json.dumps(doc), imdb_id)
-    )
+    con.execute("UPDATE movies SET personal = ? WHERE imdb_id = ?", (value, imdb_id))
     con.commit()
     con.close()
 
@@ -80,7 +73,9 @@ class Stub(BaseHTTPRequestHandler):
                 "Response": "False",
                 "Error": "Some new OMDB error this stub doesn't know",
             }
-        elif imdb_id.startswith("ttfail"):
+        elif title == "TriggerHangUp":
+            return
+        elif title == "TriggerNotJson" or imdb_id.startswith("ttfail"):
             body = b"<html>upstream exploded</html>"
             self.send_response(502)
             self.send_header("Content-Length", str(len(body)))
@@ -93,11 +88,11 @@ class Stub(BaseHTTPRequestHandler):
             doc = dict(OMDB_DOC)
             if imdb_id:
                 doc["imdbID"] = imdb_id
-            # refresh-by-id path: tt0000002 gets Response=True with no Title
+            # tt0000002 succeeds but has no Title
             if imdb_id == "tt0000002":
                 del doc["Title"]
             if imdb_id == "tt0000003":
-                rerate_mid_run(imdb_id, "RERATED")
+                rerate_mid_run(imdb_id, 42)
         body = json.dumps(doc).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -135,7 +130,7 @@ def scenario_db(tmp, src, name, keep_ids, extra_rows=()):
     marks = ",".join("?" * len(keep_ids))
     con.execute(f"DELETE FROM movies WHERE imdb_id NOT IN ({marks})", keep_ids)
     for imdb_id, doc in extra_rows:
-        con.execute("INSERT INTO movies VALUES (?, ?)", (imdb_id, json.dumps(doc)))
+        insert_movie(con, imdb_id, doc)
     con.commit()
     con.close()
     return path
@@ -148,8 +143,20 @@ def movie_data(db_path, imdb_id):
     return row[0]
 
 
-def rated(title, value="8/10"):
-    return {"title": title, "ratings": [{"source": "Personal", "value": value}]}
+# Sorts before anything refreshed during the test.
+LONG_AGO = "2000-01-01T00:00:00.000+00:00"
+
+
+def insert_movie(con, imdb_id, doc, personal=80):
+    """Stores a movie directly, as if last refreshed long ago."""
+    con.execute(
+        "INSERT INTO movies (imdb_id, data, personal, refreshed) VALUES (?, ?, ?, ?)",
+        (imdb_id, json.dumps(doc), personal, LONG_AGO),
+    )
+
+
+def titled(title):
+    return {"title": title, "ratings": []}
 
 
 def main():
@@ -174,9 +181,8 @@ def main():
             [BIN, "serve", "--host", "127.0.0.1", "--port", "8123"], env=env
         )
         try:
-            # Fail loudly if the server dies or never comes up — falling
-            # through silently would surface as an unrelated traceback on
-            # the first real request, with no results printed.
+            # Stop here if the server dies or never starts. Otherwise the
+            # first test fails with a confusing traceback.
             for _ in range(50):
                 if proc.poll() is not None:
                     sys.exit(f"server exited during startup (code {proc.poll()})")
@@ -188,8 +194,8 @@ def main():
             else:
                 sys.exit("server did not answer within 5s")
 
-            # Full RFC 9457 shape checked once here; the rest of the error
-            # tests only assert the members they care about.
+            # Check the full problem shape once here. Later error tests only
+            # check the fields they care about.
             s, b, headers = req_full("GET", "/movies", key=None)
             prob = json.loads(b)
             results.append(
@@ -204,8 +210,8 @@ def main():
                 )
             )
 
-            # Unmatched paths and unsupported methods must keep the JSON
-            # error contract — axum's bare defaults are empty-bodied.
+            # Unknown paths and wrong methods should still get JSON errors.
+            # axum's defaults have empty bodies.
             s, b = req("GET", "/nonexistent")
             results.append(("404 JSON on unmatched path", s == 404 and "detail" in b))
             s, b, headers = req_full("DELETE", "/movies")
@@ -221,7 +227,7 @@ def main():
             )
 
             s, b, headers = req_full(
-                "POST", "/movies?title=The+Matrix&rating=9/10&year=1999"
+                "POST", "/movies?title=The+Matrix&rating=90&year=1999"
             )
             doc = json.loads(b) if s == 201 else {}
             results.append(
@@ -230,17 +236,19 @@ def main():
                     s == 201
                     and doc.get("title") == "The Matrix"
                     and doc.get("imdb_id") == "tt0133093"  # imdbID -> snake_case
-                    and doc["ratings"][-1] == {"source": "Personal", "value": "9/10"}
+                    and doc.get("personal") == 90
+                    and all(r["source"] != "Personal" for r in doc["ratings"])
                     and "response" not in doc
                     and headers.get("location") == "/movies/tt0133093",
                 )
             )
-            # POST is a fresh OMDB pull, so it stamps _refreshed like refresh
-            # does — a newly added movie must not jump the next refresh queue.
+            # POST fetches from OMDB too, so it sets refreshed. Otherwise a
+            # new movie would go to the front of the next refresh.
             results.append(
                 (
-                    "POST stamps _refreshed",
-                    doc.get("_refreshed", "").endswith("+00:00"),
+                    "POST sets refreshed",
+                    doc.get("refreshed", "").endswith("+00:00")
+                    and "_refreshed" not in doc,
                 )
             )
 
@@ -251,10 +259,7 @@ def main():
                     "GET /movies doc shape",
                     s == 200
                     and len(docs) == 1
-                    and docs[0]["title"] == "The Matrix"
-                    and docs[0]["ratings"][-1]
-                    == {"source": "Personal", "value": "9/10"}
-                    and "response" not in docs[0],
+                    and docs[0] == doc,
                 )
             )
             s, _ = req("GET", "/movies/tt0133093")
@@ -270,7 +275,7 @@ def main():
                     s == 200 and len(json.loads(b)) == 1,
                 )
             )
-            # A filter matching nothing is an empty collection, not an error.
+            # A filter that matches nothing returns [], not an error.
             s, b = req("GET", "/movies?title=No+Such+Movie&year=1900")
             results.append(
                 (
@@ -279,16 +284,13 @@ def main():
                 )
             )
 
-            # (title, year) isn't UNIQUE — a second movie sharing both is
-            # ordinary filter output (both rows), not an error and not a
-            # silent pick of one of them.
+            # Title and year aren't unique. Two movies with the same pair
+            # should both be returned.
             dup_db = sqlite3.connect(db_path)
-            dup_db.execute(
-                "INSERT INTO movies VALUES (?, ?)",
-                (
-                    "tt0133093-dup",
-                    json.dumps({"title": "The Matrix", "year": "1999", "ratings": []}),
-                ),
+            insert_movie(
+                dup_db,
+                "tt0133093-dup",
+                {"title": "The Matrix", "year": "1999", "ratings": []},
             )
             dup_db.commit()
             dup_db.close()
@@ -327,38 +329,40 @@ def main():
             s, _ = req("GET", "/movies/tt9999999/history")
             results.append(("404 history for unknown id", s == 404))
 
-            # Missing required POST params must fail the same way every other
-            # invalid request does (422 JSON), not axum's default rejection
-            # (400 plain text) — previously a documented gap, now closed.
+            # Missing POST params get a 422 problem response, like any other
+            # bad request, not axum's plain-text 400.
             s, b = req("POST", "/movies?title=The+Matrix")  # rating & year missing
             results.append(
                 ("422 JSON on malformed POST params", s == 422 and "detail" in b)
             )
 
-            # Present-but-empty params are as unresolvable as missing ones —
-            # 422, not a pass-through to OMDB and whatever it answers.
-            s, b = req("POST", "/movies?title=&rating=9/10&year=1999")
+            # Empty params are treated as missing (422), not sent to OMDB.
+            s, b = req("POST", "/movies?title=&rating=90&year=1999")
             results.append(("422 on empty POST param", s == 422 and "non-empty" in b))
 
-            # OMDB's shared daily quota being exhausted is an upstream
-            # problem, not the caller's — 503 + Retry-After, not 429. The
-            # distinct problem `type` is what lets clients tell this 503
-            # from the at-capacity one without parsing `detail` prose.
+            # rating is a whole number from 0 to 100, checked before OMDB is
+            # asked anything.
+            for bad in ["101", "9/10", "7.5", "-1", ""]:
+                s, b = req("POST", f"/movies?title=The+Matrix&rating={bad}&year=1999")
+                results.append((f"422 on rating={bad}", s == 422 and "detail" in b))
+
+            # OMDB running out of quota isn't the caller's fault, so it's a
+            # 503 with Retry-After, not a 429.
             s, b, headers = req_full(
                 "POST", "/movies?title=TriggerDailyLimit&rating=1&year=2000"
             )
             prob = json.loads(b)
             results.append(
                 (
-                    "503 + Retry-After + type URN on OMDB daily limit",
+                    "503 + Retry-After on OMDB daily limit",
                     s == 503
                     and "daily request limit" in prob["detail"].lower()
-                    and prob["type"] == "urn:moviedb:problem:omdb-quota-exhausted"
+                    and prob["type"] == "about:blank"
                     and headers.get("retry-after") == "86400",
                 )
             )
 
-            # OMDB has been seen sending this spelling of the same error.
+            # OMDB sometimes words the same error this way.
             s, b, headers = req_full(
                 "POST", "/movies?title=TriggerDailyLimitAlt&rating=1&year=2000"
             )
@@ -369,27 +373,30 @@ def main():
                 )
             )
 
-            # An OMDB error this server doesn't recognize is a bad response
-            # from an upstream dependency — 502, not the non-standard 520.
+            # An OMDB error we don't recognise is a 502.
             s, b = req("POST", "/movies?title=TriggerUnknownError&rating=1&year=2000")
             results.append(
                 ("502 on unrecognized OMDB error", s == 502 and "detail" in b)
             )
 
-            # Re-POSTing an already-stored imdb_id is an update, not a
-            # create: 200, not 201 — and the new rating replaces the old one.
-            # No sleep needed: `observed` is millisecond-precision, so this
-            # snapshot can't collide with the first POST's (which second-
-            # precision timestamps used to, silently dropping it).
-            s, b = req("POST", "/movies?title=The+Matrix&rating=9.5/10&year=1999")
+            # OMDB failing to give a JSON answer is a 502 too, not a 500.
+            s, b = req("POST", "/movies?title=TriggerNotJson&rating=1&year=2000")
+            results.append(
+                ("502 when OMDB's reply isn't JSON", s == 502 and "Bad response" in b)
+            )
+            s, b = req("POST", "/movies?title=TriggerHangUp&rating=1&year=2000")
+            results.append(
+                ("502 when OMDB hangs up", s == 502 and "Bad response" in b)
+            )
+
+            # POSTing a stored movie again is an update: 200, not 201, and
+            # the new rating replaces the old one. No sleep is needed, since
+            # timestamps have millisecond precision and won't clash with the
+            # first POST's snapshot.
+            s, b = req("POST", "/movies?title=The+Matrix&rating=95&year=1999")
             doc = json.loads(b) if s == 200 else {}
             results.append(
-                (
-                    "POST updates existing movie -> 200 JSON",
-                    s == 200
-                    and doc.get("ratings", [{}])[-1]
-                    == {"source": "Personal", "value": "9.5/10"},
-                )
+                ("POST updates existing movie -> 200 JSON", s == 200 and doc.get("personal") == 95)
             )
             s, b = req("GET", "/movies/tt0133093/history")
             h = json.loads(b)
@@ -400,24 +407,23 @@ def main():
                 )
             )
 
-            # /movies/recent is a bare array like GET /movies (the
-            # envelope-free collection convention), with last_refreshed
-            # folded into each doc, not carried on a wrapper object.
+            # /movies/recent returns plain stored docs, like GET /movies.
             s, b = req("GET", "/movies/recent?limit=5")
             recent = json.loads(b)
             results.append(
                 (
-                    "GET /movies/recent bare array + last_refreshed",
+                    "GET /movies/recent bare array of stored docs",
                     s == 200
                     and isinstance(recent, list)
                     and len(recent) == 1
                     and recent[0]["imdb_id"] == "tt0133093"
-                    and recent[0]["last_refreshed"].endswith("+00:00"),
+                    and recent[0]["refreshed"].endswith("+00:00")
+                    and "last_refreshed" not in recent[0],
                 )
             )
 
-            # limit=0 is a valid request for zero movies — the DB has one,
-            # so [] proves it wasn't silently promoted to limit=1.
+            # limit=0 should return []. There's a movie in the database, so
+            # this proves it wasn't treated as limit=1.
             s, b = req("GET", "/movies/recent?limit=0")
             results.append(
                 ("GET /movies/recent?limit=0 -> []", s == 200 and json.loads(b) == [])
@@ -426,8 +432,8 @@ def main():
             proc.terminate()
             proc.wait()
 
-        # empty API_KEY must be a startup failure, not silently-open auth
-        # (an empty x-api-key header is legal HTTP and would match it)
+        # An empty API_KEY must stop the server starting. Otherwise an empty
+        # x-api-key header would match it.
         p = subprocess.run(
             [BIN, "serve", "--port", "8124"],
             env=dict(env, API_KEY=""),
@@ -439,9 +445,9 @@ def main():
             ("refuses empty API_KEY", p.returncode == 1 and "API_KEY" in p.stderr)
         )
 
-        # DB_PATH= must mean "unset" (the default path), not an empty path,
-        # which SQLite opens as a private temp DB per pooled connection.
-        # Nothing on a workstation has the default path, so it fails there.
+        # An empty DB_PATH should mean "use the default path", not an empty
+        # path (which SQLite opens as a temporary database). The default path
+        # doesn't exist on a workstation, so the server should fail to start.
         try:
             p = subprocess.run(
                 [BIN, "serve", "--host", "127.0.0.1", "--port", "8124"],
@@ -455,38 +461,13 @@ def main():
             empty_db_path_ok = False
         results.append(("empty DB_PATH falls back to the default", empty_db_path_ok))
 
-        # refresh edge cases: null Personal Value skips without an OMDB call;
-        # Response=True missing Title skips without persisting
+        # Refresh edge cases: a response with no Title is skipped without
+        # saving, and a re-rate made during the run is kept.
         db = sqlite3.connect(db_path)
-        db.execute(
-            "INSERT INTO movies VALUES (?, ?)",
-            (
-                "tt0000001",
-                json.dumps(
-                    {
-                        "title": "NullVal",
-                        "year": "2001",
-                        "ratings": [{"source": "Personal", "value": None}],
-                    }
-                ),
-            ),
-        )
-        b_doc = json.dumps(
-            {
-                "title": "TitleGone",
-                "year": "2003",
-                "ratings": [{"source": "Personal", "value": "8/10"}],
-            }
-        )
-        db.execute("INSERT INTO movies VALUES (?, ?)", ("tt0000002", b_doc))
-        db.execute(
-            "INSERT INTO movies VALUES (?, ?)",
-            ("tt0000003", json.dumps(rated("Rerated", "5/10"))),
-        )
-        db.execute(
-            "INSERT INTO movies VALUES (?, ?)",
-            ("tt0000005", json.dumps(rated("GoneFromOmdb"))),
-        )
+        b_doc = {"title": "TitleGone", "year": "2003", "ratings": []}
+        insert_movie(db, "tt0000002", b_doc)
+        insert_movie(db, "tt0000003", titled("Rerated"), personal=50)
+        insert_movie(db, "tt0000005", titled("GoneFromOmdb"))
         db.commit()
         db.close()
 
@@ -502,14 +483,8 @@ def main():
         ).fetchone()[0]
         results.append(
             (
-                "refresh: null Personal Value skipped",
-                "SKIP NullVal: no Personal rating" in out.stdout,
-            )
-        )
-        results.append(
-            (
                 "refresh: missing Title not persisted",
-                "missing Title" in out.stdout and b_after == b_doc,
+                "missing Title" in out.stdout and b_after == json.dumps(b_doc),
             )
         )
         results.append(
@@ -518,12 +493,13 @@ def main():
                 "OK   The Matrix (1999)" in out.stdout and out.returncode == 0,
             )
         )
-        rerated = json.loads(movie_data(db_path, "tt0000003"))
+        personal, refreshed = db.execute(
+            "SELECT personal, refreshed FROM movies WHERE imdb_id = 'tt0000003'"
+        ).fetchone()
         results.append(
             (
                 "refresh: keeps a re-rate that landed mid-run",
-                rerated["ratings"][-1] == {"source": "Personal", "value": "RERATED"}
-                and "_refreshed" in rerated,
+                personal == 42 and refreshed != LONG_AGO,
             )
         )
         results.append(
@@ -546,9 +522,9 @@ def main():
                 timeout=60,
             )
 
-        # One transient failure is moved past, but still fails the unit.
+        # One failure is skipped, but the run still exits non-zero.
         path = scenario_db(
-            tmp, db_path, "transient", ["tt0133093"], [("ttfail1", rated("Flaky"))]
+            tmp, db_path, "transient", ["tt0133093"], [("ttfail1", titled("Flaky"))]
         )
         out = run_refresh(path)
         results.append(
@@ -561,14 +537,14 @@ def main():
             )
         )
 
-        # Three in a row means OMDB is down: stop rather than time out on
-        # every remaining movie. The Matrix is stamped, so it sorts last.
+        # Three failures in a row means OMDB is down, so stop. The Matrix has
+        # been refreshed before, so it comes last.
         path = scenario_db(
             tmp,
             db_path,
             "outage",
             ["tt0133093"],
-            [(f"ttfail{i}", rated(f"Flaky{i}")) for i in range(3)],
+            [(f"ttfail{i}", titled(f"Flaky{i}")) for i in range(3)],
         )
         out = run_refresh(path)
         results.append(
@@ -580,7 +556,8 @@ def main():
             )
         )
 
-        # A rejected key would otherwise "skip" every movie and exit 0.
+        # A rejected key stops the run. Otherwise every movie would be
+        # skipped and the run would exit 0.
         path = scenario_db(tmp, db_path, "revoked", ["tt0133093"])
         before = movie_data(path, "tt0133093")
         out = run_refresh(path, OMDB_KEY="revoked")
@@ -593,7 +570,7 @@ def main():
             )
         )
 
-        # The quota running out is expected and resumable: stop, exit 0.
+        # Running out of quota is normal. Stop and exit 0.
         path = scenario_db(tmp, db_path, "exhausted", ["tt0133093"])
         before = movie_data(path, "tt0133093")
         out = run_refresh(path, OMDB_KEY="exhausted")

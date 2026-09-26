@@ -1,17 +1,17 @@
-//! Small helpers and defaults shared by more than one of the other modules
-//! (`http.rs`'s server and `refresh.rs`'s refresh job both need these).
+//! Helpers and defaults used by both the server and the refresh job.
+
+use std::process::exit;
 
 use chrono::{SecondsFormat, Utc};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
-pub(crate) const DEFAULT_OMDB_URL: &str = "https://www.omdbapi.com/";
+const DEFAULT_OMDB_URL: &str = "https://www.omdbapi.com/";
+const DEFAULT_DB_PATH: &str = "/var/lib/moviedb/movies.db";
 
-/// OMDB field name -> this API's snake_case: an underscore lands before an
-/// uppercase run's start when preceded by lowercase ("totalSeasons" ->
-/// "total_seasons"), and before a run's *last* letter when the run is
-/// followed by lowercase ("BoxOffice" -> "box_office") — so acronyms stay
-/// single words: "imdbID" -> "imdb_id", "DVD" -> "dvd". This is the only
-/// place that decides the stored/served key spelling.
+/// Converts an OMDB field name to snake_case. Acronyms stay one word:
+/// "totalSeasons" -> "total_seasons", "BoxOffice" -> "box_office",
+/// "imdbID" -> "imdb_id", "DVD" -> "dvd". Every stored and served key is
+/// spelled by this function.
 pub(crate) fn snake_case(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
     let mut out = String::with_capacity(key.len() + 4);
@@ -31,8 +31,8 @@ pub(crate) fn snake_case(key: &str) -> String {
     out
 }
 
-/// Snake-cases the keys inside each ratings entry ("Source" -> "source",
-/// "Value" -> "value" in practice), leaving non-object entries untouched.
+/// Snake-cases the keys of each ratings entry ("Source" -> "source").
+/// Entries that aren't objects are left as they are.
 pub(crate) fn snake_case_entry_keys(entries: Vec<Value>) -> Vec<Value> {
     entries
         .into_iter()
@@ -47,52 +47,33 @@ pub(crate) fn snake_case_entry_keys(entries: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-/// Normalizes a Response=True OMDB payload into the stored/served shape:
-/// every key snake_cased in OMDB's original order (`preserve_order`),
-/// `Ratings` folded into `ratings` with the Personal entry appended,
-/// `Response` dropped, and `_refreshed` stamped. The single source of truth
-/// for the doc shape — `http::add_movie` and the refresh job both build
-/// their docs here.
-pub(crate) fn normalize_omdb(
-    omdb: Map<String, Value>,
-    personal: Value,
-    refreshed: &str,
-) -> Map<String, Value> {
-    let mut out = Map::new();
-    let mut ratings = Vec::new();
-    for (key, value) in omdb {
-        match key.as_str() {
-            "Response" => {}
-            "Ratings" => {
-                if let Value::Array(entries) = value {
-                    ratings = snake_case_entry_keys(entries);
-                }
-                // Reserves OMDB's position for the key; filled in below.
-                out.insert("ratings".to_string(), Value::Null);
-            }
-            _ => {
-                out.insert(snake_case(&key), value);
-            }
-        }
-    }
-    let mut personal_entry = Map::new();
-    personal_entry.insert("source".to_string(), Value::from("Personal"));
-    personal_entry.insert("value".to_string(), personal);
-    ratings.push(Value::Object(personal_entry));
-    out.insert("ratings".to_string(), Value::Array(ratings));
-    out.insert("_refreshed".to_string(), Value::from(refreshed));
+/// Turns a successful OMDB response into the doc we store. Keys are
+/// snake_cased and keep OMDB's order, `Response` is dropped, and `ratings`
+/// is always there, even if OMDB left it out. Both POST and the refresh job
+/// build their docs here.
+pub(crate) fn normalize_omdb(omdb: Map<String, Value>) -> Map<String, Value> {
+    let mut out: Map<String, Value> = omdb
+        .into_iter()
+        .filter(|(key, _)| key != "Response")
+        .map(|(key, value)| match (key.as_str(), value) {
+            ("Ratings", Value::Array(entries)) => (
+                "ratings".to_string(),
+                Value::Array(snake_case_entry_keys(entries)),
+            ),
+            (_, value) => (snake_case(&key), value),
+        })
+        .collect();
+    out.entry("ratings").or_insert_with(|| json!([]));
     out
 }
 
-/// How a Response=False OMDB payload's `Error` string should be handled.
+/// What an OMDB error response (Response=False) means for us.
 pub(crate) enum OmdbError {
-    /// The key's daily quota is spent. OMDB has been seen sending both
-    /// spellings.
+    /// The API key's daily quota is used up. OMDB words this two ways.
     DailyLimit,
-    /// OMDB answered, and has no such title (`t=`) or id (`i=`).
+    /// OMDB has no movie with that title (`t=`) or ID (`i=`).
     NotFound,
-    /// Anything else, including `Invalid API key!` — nothing a retry of the
-    /// same request will fix.
+    /// Anything else, including `Invalid API key!`. Retrying won't help.
     Other,
 }
 
@@ -104,28 +85,45 @@ pub(crate) fn classify_omdb_error(error: &str) -> OmdbError {
     }
 }
 
-/// An environment variable, with set-but-empty treated as unset: `DB_PATH=`
-/// would otherwise hand SQLite an empty path, which it opens as a private
-/// temporary database — a different one per pooled connection.
-pub(crate) fn env_nonempty(name: &str) -> Option<String> {
+/// Reads an environment variable, treating an empty value as unset. An empty
+/// `DB_PATH` would otherwise give SQLite an empty path, which it opens as a
+/// temporary database that is thrown away on exit.
+fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-/// UTC timestamp at millisecond precision with a "+00:00" (not "Z") suffix,
-/// e.g. "2026-07-17T12:34:56.789+00:00". `ratings_history` ordering is
-/// lexical on this string, so the format has to stay byte-identical (fixed
-/// width, fixed offset) run to run. Millis, not secs: `observed` is part of
-/// the `ratings_history` primary key, and at second precision two POSTs of
-/// the same movie within one second collide — `INSERT OR IGNORE` then
-/// silently drops the newer snapshot.
+/// Reads an environment variable that must be set, or exits. An empty value
+/// counts as missing: with `API_KEY=`, a blank x-api-key header would pass
+/// the key check and auth would be off.
+pub(crate) fn require_env(name: &str) -> String {
+    env_nonempty(name).unwrap_or_else(|| {
+        eprintln!("{name} not set (or empty)");
+        exit(1);
+    })
+}
+
+pub(crate) fn db_path() -> String {
+    env_nonempty("DB_PATH").unwrap_or_else(|| DEFAULT_DB_PATH.to_string())
+}
+
+pub(crate) fn omdb_url() -> String {
+    env_nonempty("OMDB_URL").unwrap_or_else(|| DEFAULT_OMDB_URL.to_string())
+}
+
+/// The current UTC time, e.g. "2026-07-17T12:34:56.789+00:00".
+///
+/// `ratings_history` is sorted by this string, so the format must never
+/// change: always the same width, always "+00:00" rather than "Z". It uses
+/// milliseconds because the timestamp is part of the history table's primary
+/// key. With whole seconds, two POSTs of the same movie in one second would
+/// clash and the second snapshot would be dropped.
 pub(crate) fn utcnow() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, false)
 }
 
-/// Constant-time byte comparison: XOR-folds all bytes up to the shorter
-/// length, then folds the length mismatch into the same diff so the
-/// comparison time depends only on the shorter input — not on whether the
-/// lengths match (which an early return would leak).
+/// Compares two byte strings in constant time, so the time taken doesn't
+/// reveal how much of the API key was right. A length mismatch is folded
+/// into the result instead of returning early.
 pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
@@ -145,21 +143,19 @@ mod tests {
 
     #[test]
     fn utcnow_is_fixed_width_millis_with_utc_offset_suffix() {
-        // ratings_history ordering is lexical on this string — the format
-        // must stay "+00:00" (never "Z") and fixed-width millisecond
-        // precision, or drift silently breaks ordering.
+        // History is sorted by this string, so the format must not drift.
         let now = utcnow();
         assert!(now.ends_with("+00:00"), "got: {now}");
         assert!(!now.ends_with('Z'), "got: {now}");
-        // "2026-07-17T12:34:56.789+00:00" — 29 bytes, '.' at index 19.
+        // "2026-07-17T12:34:56.789+00:00" is 29 bytes with '.' at index 19.
         assert_eq!(now.len(), 29, "got: {now}");
         assert_eq!(now.as_bytes()[19], b'.', "got: {now}");
     }
 
     #[test]
     fn snake_case_handles_words_acronyms_and_mixed() {
-        // The full multi-word OMDB key set, plus the acronym shapes that
-        // break naive camel->snake splitting.
+        // Every multi-word OMDB key, plus the acronyms that trip up a naive
+        // conversion.
         assert_eq!(snake_case("Title"), "title");
         assert_eq!(snake_case("imdbID"), "imdb_id");
         assert_eq!(snake_case("imdbRating"), "imdb_rating");
@@ -168,7 +164,7 @@ mod tests {
         assert_eq!(snake_case("totalSeasons"), "total_seasons");
         assert_eq!(snake_case("DVD"), "dvd");
         assert_eq!(snake_case("Metascore"), "metascore");
-        // Already-snake input is a fixed point (idempotent on re-normalize).
+        // Keys that are already snake_case come back unchanged.
         assert_eq!(snake_case("imdb_id"), "imdb_id");
         assert_eq!(snake_case("_refreshed"), "_refreshed");
     }
@@ -189,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_omdb_snake_cases_keys_folds_ratings_and_stamps() {
+    fn normalize_omdb_snake_cases_keys_and_drops_response() {
         let omdb = json!({
             "Title": "The Matrix",
             "Year": "1999",
@@ -201,27 +197,26 @@ mod tests {
         let Value::Object(omdb) = omdb else {
             unreachable!()
         };
-        let out = normalize_omdb(omdb, json!("9/10"), "2026-01-01T00:00:00.000+00:00");
+        let out = normalize_omdb(omdb);
+        assert_eq!(
+            Value::Object(out),
+            json!({
+                "title": "The Matrix",
+                "year": "1999",
+                "ratings": [{"source": "Internet Movie Database", "value": "8.7/10"}],
+                "imdb_id": "tt0133093",
+                "box_office": "$172,076,928",
+            })
+        );
+    }
 
-        assert_eq!(
-            out.keys().collect::<Vec<_>>(),
-            [
-                "title",
-                "year",
-                "ratings",
-                "imdb_id",
-                "box_office",
-                "_refreshed"
-            ]
-        );
-        assert_eq!(
-            out["ratings"],
-            json!([
-                {"source": "Internet Movie Database", "value": "8.7/10"},
-                {"source": "Personal", "value": "9/10"},
-            ])
-        );
-        assert_eq!(out["_refreshed"], json!("2026-01-01T00:00:00.000+00:00"));
+    #[test]
+    fn normalize_omdb_keeps_omdb_key_order() {
+        let Value::Object(omdb) = json!({"Year": "1999", "Title": "X", "Ratings": []}) else {
+            unreachable!()
+        };
+        let out = normalize_omdb(omdb);
+        assert_eq!(out.keys().collect::<Vec<_>>(), ["year", "title", "ratings"]);
     }
 
     #[test]
@@ -229,22 +224,7 @@ mod tests {
         let Value::Object(omdb) = json!({"Title": "No Ratings Field"}) else {
             unreachable!()
         };
-        let out = normalize_omdb(omdb, json!("5/10"), "now");
-        assert_eq!(
-            out["ratings"],
-            json!([{"source": "Personal", "value": "5/10"}])
-        );
-    }
-
-    #[test]
-    fn normalize_omdb_preserves_non_string_personal_value() {
-        // A hand-edited row can hold a non-string Personal value; it must
-        // round-trip as-is, not be stringified.
-        let Value::Object(omdb) = json!({"Title": "X"}) else {
-            unreachable!()
-        };
-        let out = normalize_omdb(omdb, json!(9), "now");
-        assert_eq!(out["ratings"][0]["value"], json!(9));
+        assert_eq!(normalize_omdb(omdb)["ratings"], json!([]));
     }
 
     #[test]
@@ -278,8 +258,7 @@ mod tests {
 
     #[test]
     fn ct_eq_folds_length_mismatch_constant_time() {
-        // Shorter-side prefix matches but lengths differ — must still fail,
-        // without returning early on the length check alone.
+        // One input is a prefix of the other. Still not equal.
         assert!(!ct_eq(b"abc", b"abcd"));
         assert!(!ct_eq(b"abcd", b"abc"));
         assert!(!ct_eq(b"abc", b"abc\0"));

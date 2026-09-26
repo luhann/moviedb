@@ -5,10 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>moviedb — ledger</title>
-<!-- Set the theme before the stylesheet is parsed, so a light-mode reader
-     never gets a frame of the dark ground. Same key and dark default as
-     hln.luhann.com and luhann.com; localStorage is per-origin, so the
-     choice is remembered per site rather than shared between them. -->
+<!-- Set the theme before the stylesheet loads, so light mode never flashes
+     dark first. Uses the same key and dark default as hln.luhann.com and
+     luhann.com. localStorage is per site, so each remembers its own choice. -->
 <script>
 (function () {
   var key = "theme_pref_v2";
@@ -20,21 +19,20 @@
 <link rel="preload" href="fonts/EBGaramond-VariableFont_wght.woff2" as="font" type="font/woff2" crossorigin="anonymous">
 <link rel="preload" href="fonts/IBMPlexSans-VariableFont_wdth,wght.woff2" as="font" type="font/woff2" crossorigin="anonymous">
 <style>
-  /* Faces are served from this origin by the same Caddy file_server that
-     serves this page — no remote font import, so the dashboard needs no
-     font-src exception and leaks nothing to a CDN. Same three woff2 files
-     luhann.com self-hosts. */
+  /* The fonts are served by the same Caddy as this page rather than a CDN,
+     so nothing is fetched from anywhere else. They're the same three files
+     luhann.com uses. */
   @font-face { font-family: "EB Garamond"; src: url("fonts/EBGaramond-VariableFont_wght.woff2") format("woff2"); font-weight: 400 700; font-style: normal; font-display: swap; }
   @font-face { font-family: "IBM Plex Sans"; src: url("fonts/IBMPlexSans-VariableFont_wdth,wght.woff2") format("woff2"); font-weight: 400 600; font-style: normal; font-display: swap; }
   @font-face { font-family: "IBM Plex Mono"; src: url("fonts/IBMPlexMono-Regular.woff2") format("woff2"); font-weight: 400 500; font-style: normal; font-display: swap; }
 
-  /* Patroclus — hln.luhann.com's token block, plus the two values it has
-     no use for and this page does: accent_meta (the delta column's red on
-     paper) and derived.shadow (the tooltip and the picker's dropdown).
-     Both come from ~/dev/patroclus/design.yaml, so a diff against hln.css
-     should show those two lines and nothing else. Dark is the default there
-     and here; light is opt-in via data-theme, not the OS setting. Do not
-     hand-edit these values: change design.yaml, regenerate, re-copy. */
+  /* Patroclus theme tokens, copied from hln.luhann.com, plus two values
+     that site doesn't use: accent_meta (the red in the delta column in
+     light mode) and derived.shadow (the tooltip and dropdown). Both come from
+     ~/dev/patroclus/design.yaml, so diffing this against hln.css should show
+     only those two lines. Dark is the default; light is chosen through
+     data-theme, not the OS setting. Don't edit these by hand: change
+     design.yaml, regenerate and copy them again. */
   /* patroclus-tokens: begin */
   :root,
   [data-theme="dark"] {
@@ -71,13 +69,11 @@
   }
   /* patroclus-tokens: end */
 
-  /* This dashboard's roles, mapped onto those tokens. Every rule below
-     addresses a role, never a patroclus token directly, so re-pointing a
-     role is a one-line change here.
+  /* This page's own colour roles, mapped onto the tokens above. The rules
+     below only use these roles, so changing one is a one-line edit.
 
-     The three text weights take patroclus's three: data reads as the
-     emphasised layer (headline), prose and notes as body text, labels and
-     axis ticks as muted. */
+     Text has three levels: data uses the headline colour, prose and notes
+     the body colour, and labels and axis ticks the muted colour. */
   :root {
     color-scheme: dark;
     --page:        var(--site-bg);
@@ -86,9 +82,8 @@
     --ink-2:       var(--site-text);
     --ink-muted:   var(--site-muted);
     --grid:        var(--site-line);
-    /* One step up from the gridlines: an axis baseline is a statement, a
-       gridline is scaffolding. Patroclus carries a single line colour, so
-       the step is mixed rather than invented. */
+    /* Slightly stronger than the gridlines, so axis lines stand out from
+       them. Patroclus only has one line colour, so this mixes it with muted. */
     --baseline:    color-mix(in oklab, var(--site-line) 55%, var(--site-muted));
     --border:      var(--site-line);
     --border-2:    var(--site-line);
@@ -99,27 +94,24 @@
     --accent:      var(--site-accent);
     --accent-soft: color-mix(in oklab, var(--site-accent) 16%, transparent);
 
-    /* Series colours come from patroclus's desktop row (design.yaml
-       themes.screen.desktop.ansi), which is pitched at copper and steel's
-       lightness and chroma so a categorical set reads as one palette
-       instead of borrowed from another. Copper is "you"; the other three
-       keep each service's own hue family — ochre for IMDb's yellow, dusty
-       rose for Rotten Tomatoes, sage for Metacritic. */
+    /* Series colours come from patroclus's desktop ANSI palette
+       (themes.screen.desktop.ansi in design.yaml), which matches the
+       brightness of the copper and steel accents so they look like one set.
+       Copper is you. The others follow each site's own colour: ochre for
+       IMDb's yellow, dusty rose for Rotten Tomatoes, sage for Metacritic. */
     --imdb:        #bf9932;   /* ochre */
     --rt:          #c081aa;   /* dusty rose */
     --mc:          #719e58;   /* sage */
 
-    /* Divergence is direction, not valence, so it takes the two accents
-       rather than a red/green pair: copper against steel separates further
-       by hue than copper against alizarin, which share a warm register. */
+    /* Divergence shows direction, not good or bad, so it uses the two accents
+       rather than red and green. Copper and steel are also easier to tell
+       apart than copper and red. */
     --diverge-neg: var(--site-accent-cool);
-    --diverge-mid: var(--site-surface-soft);
 
-    /* These three do carry valence. Patroclus has no green, so --good
-       borrows hln.css's site-level pair (its `--site-repo`), which was
-       picked as a companion to this palette for exactly this reason: the
-       ANSI sage is pitched for a dark terminal and goes thin as small text
-       on paper. */
+    /* These three do mean good or bad. Patroclus has no green, so --good
+       uses the green from hln.css (`--site-repo`), which was picked to go
+       with this palette. The ANSI sage is meant for a dark terminal and is
+       too faint as small text on a light background. */
     --good:        #7ba05b;
     --critical:    #d33949;   /* alizarin, lifted off black */
     --warning:     #bf9932;   /* ochre */
@@ -127,8 +119,8 @@
 
   [data-theme="light"] {
     color-scheme: light;
-    /* On paper the lifted red is unnecessary — alizarin proper is the
-       palette's own meta accent and reads better against warm white. */
+    /* In light mode the brightened red isn't needed. The palette's own
+       accent red reads better on the warm white. */
     --critical:    var(--site-accent-meta);
     --good:        #4a7233;
   }
@@ -144,11 +136,10 @@
     text-rendering: optimizeLegibility;
   }
 
-  /* Old-style figures are what give the serif its voice in a heading like
-     "Marley & Me (2008)", but they are wrong wherever digits have to line
-     up in a column. Everything numeric asks for lining, tabular figures
-     instead — font-feature-settings would otherwise win over the
-     font-variant-numeric these rules already set. */
+  /* Old-style figures suit the serif in headings like "Marley & Me (2008)",
+     but digits in columns need to line up. Anything numeric uses lining,
+     tabular figures instead. This has to be set here, because
+     font-feature-settings overrides font-variant-numeric. */
   .stat-tile .value,
   table.ledger td.num, table.ledger th.num,
   .meter .m-raw,
@@ -169,12 +160,10 @@
     flex-direction: column;
     gap: 28px;
   }
-  /* Flex/grid items default to min-width:auto, not 0 — meaning they won't
-     shrink below their content's natural minimum width even when told to
-     stretch to a narrower container. On a phone viewport, that lets a
-     nowrap label or a wide table quietly force every ancestor (this column
-     of panels, then body) wider than the screen, so the whole page scrolls
-     sideways instead of just the one element that's actually too wide. */
+  /* Flex and grid items default to min-width: auto, so they won't shrink
+     below their content. On a phone, one wide table or unwrapped label
+     would make the whole page wider than the screen and scroll sideways.
+     Setting min-width: 0 keeps the overflow inside that one element. */
   .wrap > * { min-width: 0; }
 
   /* ---------- header ---------- */
@@ -235,9 +224,8 @@
     display: flex; align-items: center; justify-content: flex-end; gap: 8px;
   }
 
-  /* hln.luhann.com's toggle, same shape and same sun/moon swap. Scoped to
-     the masthead so it outranks `.meta-stamp button` above, which would
-     otherwise square off the pill and re-pad it. */
+  /* The same theme toggle as hln.luhann.com. Scoped to the header so it
+     overrides `.meta-stamp button` above, which would square it off. */
   .meta-stamp .theme-toggle {
     align-items: center;
     background: var(--site-surface);
@@ -303,10 +291,9 @@
   .stat-tile .sub { font-family: var(--font-sans); font-size: 12px; color: var(--ink-2); margin-top: 4px; }
 
   /* ---------- panels ---------- */
-  /* minmax(0, ...) not bare fr — a bare `1fr` track defaults to
-     minmax(auto, 1fr), so wide content inside one column (the ledger
-     table, the wide scatter charts) stops the whole track from shrinking
-     on a narrow viewport. Same root cause as the .wrap > * rule above. */
+  /* minmax(0, ...) instead of plain fr. A plain `1fr` is minmax(auto, 1fr),
+     so a wide table or chart in one column would stop the grid shrinking on
+     a narrow screen. Same problem as the .wrap > * rule above. */
   .grid-2 { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr); gap: 20px; }
   .grid-2b { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
   .panel {
@@ -418,10 +405,8 @@
   #tooltip b { font-weight: 700; }
 
   /* ---------- table ---------- */
-  /* On narrow viewports the 5-column table is wider than the panel — this
-     lets the table itself scroll horizontally instead of the whole page
-     (which is what was happening on mobile: the table pushed the page's
-     own width out, so everything scrolled sideways, not just the table). */
+  /* On narrow screens the table is wider than its panel. Let the table
+     scroll sideways on its own instead of the whole page. */
   #ledgerWrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   table.ledger { width: 100%; min-width: 480px; border-collapse: collapse; font-size: 13px; }
   table.ledger th {
@@ -715,7 +700,7 @@
 
     <div class="panel">
       <div class="panel-head">
-        <div><h2>By content rating</h2><p class="note" id="ratedNote">Average personal score by MPAA rating.</p></div>
+        <div><h2>By content rating</h2><p class="note">Average personal score by MPAA rating (0–100 scale, same axis every row).</p></div>
         <div class="index">06 / rated</div>
       </div>
       <div id="ratedWrap"></div>
@@ -831,9 +816,9 @@
     [SOURCE.RT]: "Rotten Tomatoes",
     [SOURCE.MC]: "Metacritic",
   };
-  // Used only for the drift chart's endpoint labels — the plot is narrow
-  // enough that "Rotten Tomatoes" at the right edge runs past the panel.
-  // Legend and tooltips still use the full SOURCE_LABEL names.
+  // Short names for the labels at the end of each drift chart line, where
+  // "Rotten Tomatoes" wouldn't fit. The legend and tooltips use the full
+  // names.
   const SOURCE_SHORT_LABEL = {
     [SOURCE.PERSONAL]: "You",
     [SOURCE.IMDB]: "IMDb",
@@ -861,17 +846,40 @@
     p.textContent = msg;
     node.appendChild(p);
   }
+  // Replaces whatever is in `wrap` (a previous chart or empty state) with a
+  // new, empty chart.
+  function mountChart(wrap, viewBox, ariaLabel) {
+    clear(wrap);
+    const svg = el("svg", { class: "chart", viewBox, role: "img", "aria-label": ariaLabel });
+    wrap.appendChild(svg);
+    return svg;
+  }
+  // Groups items into arrays by key, skipping items whose key is null.
+  function groupBy(items, keyOf, valueOf = (item) => item) {
+    const groups = {};
+    items.forEach((item) => {
+      const key = keyOf(item);
+      if (key != null) (groups[key] = groups[key] || []).push(valueOf(item));
+    });
+    return groups;
+  }
+  // [key, count] pairs, most common first.
+  function countBy(items, keyOf) {
+    return Object.entries(groupBy(items, keyOf))
+      .map(([key, group]) => [key, group.length])
+      .sort((a, b) => b[1] - a[1]);
+  }
 
   /* ---------------- parsing helpers ---------------- */
-  function ratingBySource(ratings, source) {
-    if (!Array.isArray(ratings)) return null;
-    const hit = ratings.find((r) => r && r.source === source);
+  // A movie's rating from one source as stored: your score, or OMDb's
+  // string for the others.
+  function rawRating(movie, source) {
+    if (source === SOURCE.PERSONAL) return movie.personal ?? null;
+    const hit = (movie.ratings || []).find((r) => r && r.source === source);
     return hit ? hit.value : null;
   }
-  // Titles/genres come from OMDb, not this app — "Dungeons & Dragons: Honor
-  // Among Thieves" or a title with an apostrophe/`<` would corrupt the
-  // markup (or worse) wherever they're interpolated into an innerHTML
-  // template. Every such interpolation goes through this first.
+  // Titles and genres come from OMDb and can contain &, ' or <. Escape
+  // anything that goes into an innerHTML template.
   function escapeHtml(str) {
     return String(str)
       .replace(/&/g, "&amp;")
@@ -880,9 +888,8 @@
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
   }
-  // The divergence chart's row labels have a fixed-width column to their
-  // left — an unclipped long title runs off the left edge of the panel.
-  // The tooltip (wired separately) always gets the untruncated title.
+  // Row labels in the divergence chart have a fixed-width column, so long
+  // titles are cut short. The tooltip shows the full title.
   function truncate(str, maxLen) {
     return str.length > maxLen ? str.slice(0, maxLen - 1).trimEnd() + "…" : str;
   }
@@ -893,27 +900,38 @@
     const n = parseFloat(raw);
     return Number.isFinite(n) ? n : null;
   }
-  // One raw rating value on a common /100 scale. Personal ratings are
-  // always entered out of 100; IMDb is the only source needing rescale.
+  // Converts a rating to a 0-100 scale. Personal ratings are already out
+  // of 100; IMDb is the only source that needs scaling.
   function scoreFor(source, raw) {
     const n = parseNumber(raw);
     if (n === null) return null;
     return source === SOURCE.IMDB ? n * 10 : n;
   }
-  function normalizedRating(ratings, source) {
-    return scoreFor(source, ratingBySource(ratings, source));
+  function normalizedRating(movie, source) {
+    return scoreFor(source, rawRating(movie, source));
   }
-  function primaryGenre(movie) {
-    if (!movie.genre || movie.genre === "N/A") return null;
-    return movie.genre.split(",")[0].trim();
+  const personalScore = (movie) => normalizedRating(movie, SOURCE.PERSONAL);
+  // A movie's Personal and IMDb scores. `delta` is null unless it has both.
+  function versusImdb(movie) {
+    const personal = personalScore(movie);
+    const imdb = normalizedRating(movie, SOURCE.IMDB);
+    const delta = personal !== null && imdb !== null ? personal - imdb : null;
+    return { personal, imdb, delta };
+  }
+  // The first name in a comma-separated OMDb field like genre or director.
+  function firstListed(field) {
+    if (!field || field === "N/A") return null;
+    return field.split(",")[0].trim();
   }
   function releaseYear(movie) {
     const m = /\d{4}/.exec(movie.year || "");
     return m ? parseInt(m[0], 10) : null;
   }
-  function primaryDirector(movie) {
-    if (!movie.director || movie.director === "N/A") return null;
-    return movie.director.split(",")[0].trim();
+  const decadeOf = (year) => Math.floor(year / 10) * 10;
+  const decadeLabel = (d) => "'" + String(d).slice(-2) + "s";
+  function releaseDecade(movie) {
+    const year = releaseYear(movie);
+    return year === null ? null : decadeOf(year);
   }
   function parseRuntime(movie) {
     const m = /\d+/.exec(movie.runtime || "");
@@ -925,9 +943,8 @@
     return Number.isFinite(n) ? n : null;
   }
   const MPAA_ORDER = ["G", "PG", "PG-13", "R", "NC-17"];
-  // Anything outside the five standard MPAA tiers (Not Rated, TV-*, N/A,
-  // foreign classifications OMDb passes through as-is) folds into one
-  // bucket rather than a long tail of one-off values.
+  // Anything other than the five standard MPAA ratings (Not Rated, TV-*,
+  // N/A, foreign ratings) goes into one bucket instead of a long list.
   function mpaaBucket(movie) {
     return MPAA_ORDER.includes(movie.rated) ? movie.rated : "Other";
   }
@@ -937,9 +954,8 @@
     if (n >= 1e3) return "$" + (n / 1e3).toFixed(0) + "K";
     return "$" + n.toFixed(0);
   }
-  // Pearson correlation coefficient — the single number that answers
-  // "does a longer runtime earn a higher score" without making the reader
-  // eyeball 179 overlapping dots for a trend that may not be there.
+  // Pearson correlation. Answers "do longer films score higher" with one
+  // number, instead of leaving the reader to spot a trend in the dots.
   function pearsonR(xs, ys) {
     const n = xs.length;
     const meanX = mean(xs), meanY = mean(ys);
@@ -961,9 +977,8 @@
     const slope = den === 0 ? 0 : num / den;
     return { slope, intercept: meanY - slope * meanX };
   }
-  // d.toFixed(0) on e.g. -0.3 prints "-0" (JS preserves the sign of a
-  // negative value that rounds to zero) — round first so the sign check
-  // and the printed digits agree.
+  // Round first: (-0.3).toFixed(0) gives "-0", which would disagree with
+  // the sign check.
   function fmtDelta(d) {
     const rounded = Math.round(d);
     return (rounded > 0 ? "+" : "") + rounded;
@@ -973,9 +988,8 @@
     if (isNaN(d)) return iso;
     return d.toISOString().slice(0, 10);
   }
-  // Axis ticks need a granularity matched to the actual spread of data —
-  // three refresh snapshots a week apart all render as "2026-07" under a
-  // fixed year-month format, which is technically correct and useless.
+  // Pick the tick format from the date range. Three snapshots a week apart
+  // would all show as "2026-07" with a fixed year-month format.
   function formatAxisDate(t, spanMs) {
     const d = new Date(t);
     const DAY = 86400000;
@@ -1019,8 +1033,8 @@
     return res.json();
   }
 
-  // Callers here show the server's own error (title not found, OMDb quota
-  // exhausted, ...), so a non-401 failure is reported back, not thrown.
+  // Callers show the server's error message (title not found, OMDb quota
+  // used up, ...), so non-401 errors are returned rather than thrown.
   async function apiPost(path) {
     const res = await apiRequest(path, { method: "POST" });
     let body = null;
@@ -1037,9 +1051,8 @@
     hideKeyPrompt();
     boot();
   }
-  // Charts read their colours as live var() references in SVG presentation
-  // attributes, so flipping data-theme re-paints every plot without a
-  // re-render or a re-fetch.
+  // Charts use var() colours in their SVG attributes, so changing
+  // data-theme recolours them without redrawing or refetching.
   (function () {
     const key = "theme_pref_v2";
     const root = document.documentElement;
@@ -1080,8 +1093,8 @@
       const params = new URLSearchParams({ title, year, rating });
       const { ok, status: httpStatus, body } = await apiPost("/movies?" + params.toString());
       if (ok) {
-        const docTitle = (body && body.title) || title;
-        const docYear = (body && body.year) || year;
+        const docTitle = body?.title || title;
+        const docYear = body?.year || year;
         status.textContent = httpStatus === 201
           ? `Added "${docTitle}" (${docYear}) to the ledger.`
           : `"${docTitle}" (${docYear}) was already catalogued — rating updated.`;
@@ -1089,7 +1102,7 @@
         document.getElementById("addForm").reset();
         boot(); // re-fetch + re-render everything so the new/updated title shows up immediately
       } else {
-        status.textContent = (body && body.detail) || `Request failed (${httpStatus}).`;
+        status.textContent = body?.detail || `Request failed (${httpStatus}).`;
         status.className = "add-form-status err";
       }
     } catch (err) {
@@ -1124,20 +1137,12 @@
     document.getElementById("statCountSub").textContent =
       years.length ? Math.min(...years) + " – " + Math.max(...years) : "no titles yet";
 
-    const personalVals = movies
-      .map((m) => normalizedRating(m.ratings, SOURCE.PERSONAL))
-      .filter((v) => v !== null);
+    const personalVals = movies.map(personalScore).filter((v) => v !== null);
     document.getElementById("statAvgPersonal").innerHTML = personalVals.length
       ? mean(personalVals).toFixed(0) + "<small>/100</small>"
       : "—";
 
-    const deltas = movies
-      .map((m) => {
-        const p = normalizedRating(m.ratings, SOURCE.PERSONAL);
-        const i = normalizedRating(m.ratings, SOURCE.IMDB);
-        return p !== null && i !== null ? p - i : null;
-      })
-      .filter((v) => v !== null);
+    const deltas = movies.map((m) => versusImdb(m).delta).filter((v) => v !== null);
     const avgDeltaEl = document.getElementById("statAvgDelta");
     if (deltas.length) {
       const avg = mean(deltas);
@@ -1150,44 +1155,24 @@
       document.getElementById("statAvgDeltaSub").textContent = "no comparable titles yet";
     }
 
-    const decades = new Set(years.map((y) => Math.floor(y / 10) * 10));
-    document.getElementById("statDecades").textContent = decades.size || "—";
-    if (decades.size) {
-      const sorted = [...decades].sort((a, b) => a - b);
-      const counts = {};
-      years.forEach((y) => {
-        const d = Math.floor(y / 10) * 10;
-        counts[d] = (counts[d] || 0) + 1;
-      });
-      const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
-      document.getElementById("statDecadesSub").textContent =
-        "'" + String(top[0]).slice(-2) + "s dominate the shelf (" + top[1] + ")";
-    } else {
-      document.getElementById("statDecadesSub").textContent = "";
-    }
+    const decades = countBy(years, decadeOf);
+    document.getElementById("statDecades").textContent = decades.length || "—";
+    document.getElementById("statDecadesSub").textContent = decades.length
+      ? decadeLabel(decades[0][0]) + " dominate the shelf (" + decades[0][1] + ")"
+      : "";
   }
 
   /* ---------------- verdict divergence ---------------- */
   function renderDivergence(movies) {
-    // Recreate the mount unconditionally, not just draw into it: a prior
-    // empty render (see emptyState) removes #divergeChart entirely, and
-    // without this, the next call here would hand `svg` a null reference.
-    document.getElementById("divergeWrap").innerHTML =
-      '<svg class="chart" id="divergeChart" role="img" aria-label="Diverging bar chart of personal rating minus IMDb rating"></svg>';
-    const svg = document.getElementById("divergeChart");
+    const wrap = document.getElementById("divergeWrap");
     const data = movies
-      .map((m) => {
-        const p = normalizedRating(m.ratings, SOURCE.PERSONAL);
-        const i = normalizedRating(m.ratings, SOURCE.IMDB);
-        if (p === null || i === null) return null;
-        return { title: m.title, year: releaseYear(m), delta: p - i, personal: p, imdb: i };
-      })
-      .filter((d) => d !== null)
+      .map((m) => ({ title: m.title, year: releaseYear(m), ...versusImdb(m) }))
+      .filter((d) => d.delta !== null)
       .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
       .slice(0, 8);
 
     if (!data.length) {
-      emptyState(document.getElementById("divergeWrap"), "No titles with both a Personal and an IMDb rating yet.");
+      emptyState(wrap, "No titles with both a Personal and an IMDb rating yet.");
       return;
     }
 
@@ -1197,8 +1182,7 @@
     const domain = Math.max(20, Math.ceil(maxAbs / 10) * 10);
     const pxPerUnit = (chartW - labelW - 40) / 2 / domain;
     const height = top + data.length * rowH + 26;
-    svg.setAttribute("viewBox", `0 0 ${chartW} ${height}`);
-    clear(svg);
+    const svg = mountChart(wrap, `0 0 ${chartW} ${height}`, "Diverging bar chart of personal rating minus IMDb rating");
 
     svg.appendChild(el("line", {
       x1: x0, x2: x0, y1: top - 6, y2: top + data.length * rowH,
@@ -1236,106 +1220,69 @@
   }
 
   /* ---------------- genre / decade bars ---------------- */
-  function renderBarChart(svgId, wrapId, data, opts) {
+  // Horizontal bars. `data` is [{ label, value, tip }]. Bars scale to the
+  // largest value unless opts.max fixes the scale.
+  function renderBarChart(wrapId, data, opts) {
     const wrap = document.getElementById(wrapId);
-    // Same recreate-before-draw rule as renderDivergence: a prior empty
-    // render can have removed this svg entirely.
-    wrap.innerHTML = `<svg class="chart" id="${svgId}" role="img" aria-label="${opts.ariaLabel}"></svg>`;
-    const svg = document.getElementById(svgId);
     if (!data.length) {
       emptyState(wrap, opts.emptyMsg);
       return;
     }
-    const rowH = 24, top = 6, labelW = opts.labelW, chartW = opts.chartW;
-    const max = Math.max(...data.map((d) => d.n));
-    const height = top + data.length * rowH + 6;
-    svg.setAttribute("viewBox", `0 0 ${chartW} ${height}`);
+    const rowH = 24, top = 6, labelW = opts.labelW, chartW = 560;
+    const max = opts.max || Math.max(...data.map((d) => d.value));
+    const format = opts.format || ((v) => v);
+    const svg = mountChart(wrap, `0 0 ${chartW} ${top + data.length * rowH + 6}`, opts.ariaLabel);
     data.forEach((d, i) => {
       const y = top + i * rowH, cy = y + rowH / 2;
       const label = el("text", { class: "row-label", x: labelW - 10, y: cy + 4, "text-anchor": "end" });
       label.textContent = d.label;
       svg.appendChild(label);
-      const w = (d.n / max) * (chartW - labelW - 40);
+      const w = (d.value / max) * (chartW - labelW - 40);
       const bar = el("rect", { x: labelW, y: cy - 6, width: Math.max(w, 2), height: 12, rx: 3, fill: "var(--accent)", class: "hit" });
       svg.appendChild(bar);
       const val = el("text", { class: "bar-label", x: labelW + w + 8, y: cy + 4 });
-      val.textContent = d.n;
+      val.textContent = format(d.value);
       svg.appendChild(val);
-      wire(bar, `<b>${escapeHtml(d.label)}</b><br>${plural(d.n)}`);
+      wire(bar, `<b>${escapeHtml(d.label)}</b><br>${d.tip}`);
     });
   }
 
+  const countBars = (entries) => entries.map(([label, n]) => ({ label, value: n, tip: plural(n) }));
+
   function renderGenre(movies) {
-    const counts = {};
-    movies.forEach((m) => {
-      const g = primaryGenre(m);
-      if (g) counts[g] = (counts[g] || 0) + 1;
-    });
-    let entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    let entries = countBy(movies, (m) => firstListed(m.genre));
     if (entries.length > 8) {
-      const head = entries.slice(0, 7);
       const otherCount = entries.slice(7).reduce((s, [, n]) => s + n, 0);
-      entries = head.concat([["Other", otherCount]]);
+      entries = entries.slice(0, 7).concat([["Other", otherCount]]);
     }
-    renderBarChart(
-      "genreChart", "genreWrap",
-      entries.map(([label, n]) => ({ label, n })),
-      { labelW: 100, chartW: 560, emptyMsg: "No genre data yet.", ariaLabel: "Horizontal bar chart of title counts by genre" }
-    );
+    renderBarChart("genreWrap", countBars(entries), {
+      labelW: 100, emptyMsg: "No genre data yet.", ariaLabel: "Horizontal bar chart of title counts by genre",
+    });
   }
 
   function renderDirector(movies) {
-    const counts = {};
-    movies.forEach((m) => {
-      const d = primaryDirector(m);
-      if (d) counts[d] = (counts[d] || 0) + 1;
+    // Top directors only. Unlike genres, an "Other" bucket for everyone
+    // else wouldn't mean anything.
+    const entries = countBy(movies, (m) => firstListed(m.director)).slice(0, 8);
+    renderBarChart("directorWrap", countBars(entries), {
+      labelW: 130, emptyMsg: "No director data yet.", ariaLabel: "Horizontal bar chart of title counts by director",
     });
-    // A leaderboard, not a full breakdown — unlike genre there's no
-    // meaningful "Other" bucket for a long tail of one-off directors.
-    const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 8);
-    renderBarChart(
-      "directorChart", "directorWrap",
-      entries.map(([label, n]) => ({ label, n })),
-      { labelW: 130, chartW: 560, emptyMsg: "No director data yet.", ariaLabel: "Horizontal bar chart of title counts by director" }
-    );
   }
 
   function renderRated(movies) {
-    const wrap = document.getElementById("ratedWrap");
-    wrap.innerHTML = '<svg class="chart" id="ratedChart" role="img" aria-label="Bar chart of average personal rating by content rating"></svg>';
-    const svg = document.getElementById("ratedChart");
-    const buckets = {};
-    movies.forEach((m) => {
-      const p = normalizedRating(m.ratings, SOURCE.PERSONAL);
-      if (p === null) return;
-      const b = mpaaBucket(m);
-      (buckets[b] = buckets[b] || []).push(p);
-    });
-    const order = [...MPAA_ORDER, "Other"].filter((b) => buckets[b] && buckets[b].length);
-    if (!order.length) {
-      emptyState(wrap, "No rated + personal-score data yet.");
-      return;
-    }
-    const rowH = 26, top = 6, labelW = 60, chartW = 560;
-    const plotW = chartW - labelW - 50;
-    const height = top + order.length * rowH + 6;
-    svg.setAttribute("viewBox", `0 0 ${chartW} ${height}`);
-    document.getElementById("ratedNote").textContent =
-      "Average personal score by MPAA rating (0–100 scale, same axis every row).";
-    order.forEach((bucket, i) => {
-      const vals = buckets[bucket];
-      const avg = mean(vals);
-      const y = top + i * rowH, cy = y + rowH / 2;
-      const label = el("text", { class: "row-label", x: labelW - 10, y: cy + 4, "text-anchor": "end" });
-      label.textContent = bucket;
-      svg.appendChild(label);
-      const w = (avg / 100) * plotW; // fixed 0-100 domain — buckets stay comparable to each other, not just to their own max
-      const bar = el("rect", { x: labelW, y: cy - 8, width: Math.max(w, 2), height: 16, rx: 3, fill: "var(--accent)", class: "hit" });
-      svg.appendChild(bar);
-      const val = el("text", { class: "bar-label", x: labelW + w + 8, y: cy + 4 });
-      val.textContent = avg.toFixed(0);
-      svg.appendChild(val);
-      wire(bar, `<b>${escapeHtml(bucket)}</b><br>avg ${avg.toFixed(0)}/100 · ${plural(vals.length)}`);
+    const rated = movies.filter((m) => personalScore(m) !== null);
+    const buckets = groupBy(rated, mpaaBucket, personalScore);
+    const data = [...MPAA_ORDER, "Other"]
+      .filter((b) => buckets[b])
+      .map((b) => {
+        const avg = mean(buckets[b]);
+        return { label: b, value: avg, tip: `avg ${avg.toFixed(0)}/100 · ${plural(buckets[b].length)}` };
+      });
+    // A fixed 0-100 scale, so each bar can be read as a score, not just
+    // compared with the others.
+    renderBarChart("ratedWrap", data, {
+      labelW: 60, max: 100, format: (v) => v.toFixed(0),
+      emptyMsg: "No rated + personal-score data yet.", ariaLabel: "Bar chart of average personal rating by content rating",
     });
   }
 
@@ -1346,19 +1293,18 @@
     return mag < 0.1 ? `r = ${r.toFixed(2)} — ${strength}.` : `r = ${r.toFixed(2)} — ${strength} ${sign} relationship.`;
   }
 
-  // Scatter with a dashed least-squares line and the Pearson r folded into
-  // the panel's note. The y axis always starts at 0; x is fitted to the data.
+  // Scatter plot with a dashed trend line, and Pearson r in the panel's
+  // note. The y axis starts at 0; the x axis fits the data.
   function renderScatter(wrapId, opts) {
     const wrap = document.getElementById(wrapId);
     const note = document.getElementById(opts.noteId);
     const { width, height, left, right, points } = opts;
-    wrap.innerHTML = `<svg class="chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${opts.ariaLabel}"></svg>`;
-    const svg = wrap.firstChild;
     if (points.length < 2) {
       emptyState(wrap, opts.emptyMsg);
       note.textContent = opts.question;
       return;
     }
+    const svg = mountChart(wrap, `0 0 ${width} ${height}`, opts.ariaLabel);
     const xs = points.map((p) => p.x), ys = points.map((p) => p.y);
     note.textContent = opts.question + " " + describeR(pearsonR(xs, ys));
 
@@ -1403,7 +1349,7 @@
     const points = movies
       .map((m) => {
         const runtime = parseRuntime(m);
-        const rating = normalizedRating(m.ratings, SOURCE.PERSONAL);
+        const rating = personalScore(m);
         if (runtime === null || rating === null) return null;
         return { x: runtime, y: rating, tip: `<b>${escapeHtml(m.title)}</b><br>${runtime} min · ${rating.toFixed(0)}/100` };
       })
@@ -1443,8 +1389,8 @@
       axes: (xs, ys) => {
         const xMin = Math.floor(Math.min(...xs) / 5) * 5;
         const xMax = Math.ceil(Math.max(...xs) / 5) * 5;
-        // Runtime is a ratio scale (0 means something): starting the axis
-        // anywhere else would exaggerate how much runtime varies.
+        // Start runtime at 0 too. Starting anywhere else would make the
+        // differences in runtime look bigger than they are.
         const yMax = Math.ceil(Math.max(...ys) / 10) * 10;
         const yStep = Math.ceil(yMax / 5 / 30) * 30 || 30;
         const yTicks = [];
@@ -1457,22 +1403,18 @@
     });
   }
 
-  const decadeOf = (year) => Math.floor(year / 10) * 10;
-  const decadeLabel = (d) => "'" + String(d).slice(-2) + "s";
-
-  // One column per decade from the first to the last present, empty ones
-  // included: equal-width columns on a time axis imply equal steps, so a gap
-  // (an '80s title, then nothing until the 2010s) has to show as a gap.
-  // `groups` maps decade -> the values that fell in it.
+  // One column for every decade from the first to the last, including
+  // empty ones. Equal-width columns suggest equal steps in time, so a gap
+  // between the '80s and the 2010s has to show as a gap.
+  // `groups` maps each decade to its values.
   function renderDecadeColumns(wrapId, groups, opts) {
     const wrap = document.getElementById(wrapId);
-    wrap.innerHTML = `<svg class="chart" viewBox="0 0 560 220" role="img" aria-label="${opts.ariaLabel}"></svg>`;
-    const svg = wrap.firstChild;
     const present = Object.keys(groups).map(Number).sort((a, b) => a - b);
     if (!present.length) {
       emptyState(wrap, opts.emptyMsg);
       return;
     }
+    const svg = mountChart(wrap, "0 0 560 220", opts.ariaLabel);
     const decades = [];
     for (let d = present[0]; d <= present[present.length - 1]; d += 10) decades.push(d);
     const left = 24, top = 16, plotH = 130;
@@ -1506,13 +1448,8 @@
   }
 
   function renderBoxOffice(movies) {
-    const groups = {};
-    movies.forEach((m) => {
-      const bo = parseBoxOffice(m);
-      const y = releaseYear(m);
-      if (bo !== null && y !== null) (groups[decadeOf(y)] = groups[decadeOf(y)] || []).push(bo);
-    });
-    renderDecadeColumns("boxOfficeWrap", groups, {
+    const withBoxOffice = movies.filter((m) => parseBoxOffice(m) !== null);
+    renderDecadeColumns("boxOfficeWrap", groupBy(withBoxOffice, releaseDecade, parseBoxOffice), {
       ariaLabel: "Bar chart of average box office by release decade",
       emptyMsg: "No box-office data yet.",
       value: mean,
@@ -1522,12 +1459,7 @@
   }
 
   function renderDecade(movies) {
-    const groups = {};
-    movies.forEach((m) => {
-      const y = releaseYear(m);
-      if (y !== null) (groups[decadeOf(y)] = groups[decadeOf(y)] || []).push(y);
-    });
-    renderDecadeColumns("decadeWrap", groups, {
+    renderDecadeColumns("decadeWrap", groupBy(movies, releaseDecade), {
       ariaLabel: "Bar chart of title counts by release decade",
       emptyMsg: "No release-year data yet.",
       value: (vals) => vals.length,
@@ -1544,9 +1476,8 @@
 
   function renderLedger(recentMovies) {
     const wrap = document.getElementById("ledgerWrap");
-    // Same recreate-before-draw rule as the chart panels: a prior empty
-    // render removes the whole table (ledgerBody included), so rebuild it
-    // fresh rather than assume it's still there.
+    // Rebuild the table, as with the charts: an earlier empty state removes
+    // the whole table, ledgerBody included.
     wrap.innerHTML = LEDGER_TABLE_HTML;
     const body = document.getElementById("ledgerBody");
     if (!recentMovies.length) {
@@ -1554,38 +1485,35 @@
       return;
     }
     recentMovies.forEach((m) => {
-      const p = normalizedRating(m.ratings, SOURCE.PERSONAL);
-      const i = normalizedRating(m.ratings, SOURCE.IMDB);
-      const delta = p !== null && i !== null ? p - i : null;
+      const { personal: p, imdb: i, delta } = versusImdb(m);
       const tr = document.createElement("tr");
-      const g = primaryGenre(m) || "—";
+      const g = firstListed(m.genre) || "—";
       const y = releaseYear(m) || "—";
       tr.innerHTML = `
         <td class="title-cell"><span class="t">${escapeHtml(m.title)}</span><span class="g">${escapeHtml(g)} · ${y}</span></td>
         <td class="num">${p !== null ? p.toFixed(0) : "—"}</td>
         <td class="num">${i !== null ? i.toFixed(0) : "—"}</td>
         <td class="num ${delta === null ? "" : delta >= 0 ? "delta-up" : "delta-down"}">${delta === null ? "—" : (delta >= 0 ? "▲ " : "▼ ") + Math.abs(delta).toFixed(0)}</td>
-        <td>${fmtDate(m.last_refreshed)}${isStale(m.last_refreshed) ? ' <span class="chip stale">stale</span>' : ""}</td>
+        <td>${fmtDate(m.refreshed)}${isStale(m.refreshed) ? ' <span class="chip stale">stale</span>' : ""}</td>
       `;
       body.appendChild(tr);
     });
   }
 
   /* ---------------- title inspector ---------------- */
-  // OMDb fills anything it doesn't hold with the literal string "N/A" —
-  // rendering that as a fact row is worse than dropping the row.
+  // OMDb uses the string "N/A" for anything it doesn't have. Leave those
+  // rows out rather than show "N/A".
   function presentField(v) {
     if (v == null) return null;
     const s = String(v).trim();
     return s === "" || s === "N/A" ? null : s;
   }
 
-  // The stored doc keeps each source's raw string ("6.5/10", "60%", "79"),
-  // which is the honest value to show — the bar underneath is what makes
-  // four different scales comparable, so both are drawn.
+  // Show each source's original value ("6.5/10", "60%", "79") and draw a
+  // bar underneath so the different scales can be compared.
   function meterHtml(movie, source) {
-    const raw = ratingBySource(movie.ratings, source);
-    const norm = normalizedRating(movie.ratings, source);
+    const raw = rawRating(movie, source);
+    const norm = normalizedRating(movie, source);
     if (raw === null || norm === null) return "";
     const pct = Math.max(0, Math.min(100, norm));
     return `<div class="meter">
@@ -1623,19 +1551,14 @@
     addFact("Box office", movie.box_office);
     addFact("IMDb votes", movie.imdb_votes);
 
-    const personal = normalizedRating(movie.ratings, SOURCE.PERSONAL);
-    const imdb = normalizedRating(movie.ratings, SOURCE.IMDB);
-    if (personal !== null && imdb !== null) {
-      const d = personal - imdb;
-      facts.push(["Δ vs IMDb", `<span class="${d >= 0 ? "delta-up" : "delta-down"}">${fmtDelta(d)}</span>`]);
+    const { delta } = versusImdb(movie);
+    if (delta !== null) {
+      facts.push(["Δ vs IMDb", `<span class="${delta >= 0 ? "delta-up" : "delta-down"}">${fmtDelta(delta)}</span>`]);
     }
 
-    // POST and refresh both stamp `_refreshed`; only a row from before
-    // POST did lacks it.
-    const refreshed = presentField(movie._refreshed);
-    facts.push(["Last refresh", refreshed
-      ? escapeHtml(fmtDate(refreshed)) + (isStale(refreshed) ? ' <span class="chip stale">stale</span>' : "")
-      : "—"]);
+    const refreshed = movie.refreshed;
+    facts.push(["Last refresh",
+      escapeHtml(fmtDate(refreshed)) + (isStale(refreshed) ? ' <span class="chip stale">stale</span>' : "")]);
 
     const imdbId = presentField(movie.imdb_id);
     if (imdbId) {
@@ -1644,10 +1567,10 @@
         : escapeHtml(imdbId)]);
     }
 
-    // The poster is the one thing on this page fetched from outside the
-    // house (OMDb hands back an Amazon CDN URL). no-referrer keeps the
-    // request from carrying this dashboard's own address; the scheme test
-    // keeps a hand-edited row from putting anything but http(s) in src.
+    // The poster is the only thing on the page loaded from elsewhere (an
+    // Amazon CDN URL from OMDb). no-referrer stops the request revealing
+    // this dashboard's address, and the http(s) check stops a hand-edited
+    // row from putting anything else in src.
     const poster = presentField(movie.poster);
     const posterHtml = poster && /^https?:\/\//i.test(poster)
       ? `<img class="detail-poster" src="${escapeHtml(poster)}" alt="Poster for ${escapeHtml(movie.title)}" referrerpolicy="no-referrer" loading="lazy">`
@@ -1665,8 +1588,8 @@
         </div>
       </div>`;
 
-    // A dead poster URL (OMDb rotates them) would otherwise leave a broken
-    // image icon where the artwork should be.
+    // OMDb poster URLs go stale. Hide the image if it fails to load rather
+    // than show a broken image icon.
     const img = wrap.querySelector("img.detail-poster");
     if (img) {
       img.addEventListener("error", () => {
@@ -1678,8 +1601,8 @@
     }
   }
 
-  // Type-to-filter picker over a fixed list: the input mirrors the chosen
-  // label, the listbox opens on focus and narrows as you type.
+  // A searchable dropdown. The input shows the chosen title, and the list
+  // opens on focus and narrows as you type.
   function createCombo({ input, list, onSelect }) {
     let items = [];
     let filtered = [];
@@ -1756,8 +1679,9 @@
       onSelect(item);
     }
 
-    // mousedown, not click: the input's blur would close the list first — and
-    // swallowing it on the list itself keeps a scrollbar drag from closing it.
+    // mousedown rather than click, because the input's blur would close the
+    // list before a click lands. Cancelling it on the list also stops
+    // dragging the scrollbar from closing it.
     list.onmousedown = (e) => e.preventDefault();
 
     input.oninput = () => openList(input.value);
@@ -1799,8 +1723,8 @@
       }));
   }
 
-  // Survives the full re-render that adding a title triggers, so picking a
-  // title and then cataloguing another doesn't throw away your place.
+  // Kept across the full redraw after adding a title, so the selected
+  // title stays selected.
   let detailSelected = null;
   const setDetailItems = createCombo({
     input: document.getElementById("detailSearch"),
@@ -1860,23 +1784,22 @@
       emptyState(document.getElementById("driftWrap"), "No recognizable rating sources in this title's history.");
       return;
     }
-    document.getElementById("driftWrap").innerHTML = '<svg class="chart" id="driftChart" viewBox="0 0 420 306" role="img"></svg>';
-    const freshSvg = document.getElementById("driftChart");
+    const svg = mountChart(document.getElementById("driftWrap"), "0 0 420 306", "Line chart of each rating over time");
 
     const allTimes = present.flatMap((s) => bySource[s].map((p) => p.t));
     const tMin = Math.min(...allTimes), tMax = Math.max(...allTimes);
-    // right leaves a gutter for the endpoint labels drawn past x(tMax) below
-    // — SOURCE_SHORT_LABEL's longest value ("IMDb") plus its 8px offset.
+    // Leave room on the right for the end labels: the longest short label
+    // ("IMDb") plus its 8px offset.
     const left = 34, right = 40, top = 10, bottom = 28;
     const w = 420 - left - right, h = 306 - top - bottom;
     const x = (t) => (tMax === tMin ? left + w / 2 : left + ((t - tMin) / (tMax - tMin)) * w);
     const y = (v) => top + h - (v / 100) * h;
 
     [0, 25, 50, 75, 100].forEach((v) => {
-      freshSvg.appendChild(el("line", { x1: left, x2: left + w, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
+      svg.appendChild(el("line", { x1: left, x2: left + w, y1: y(v), y2: y(v), stroke: "var(--grid)", "stroke-width": 1 }));
       const t = el("text", { class: "axis-tick", x: left - 8, y: y(v) + 3, "text-anchor": "end" });
       t.textContent = v;
-      freshSvg.appendChild(t);
+      svg.appendChild(t);
     });
     const span = tMax - tMin;
     const dateTicks = tMax === tMin ? [tMin] : [tMin, tMin + span / 2, tMax];
@@ -1887,14 +1810,13 @@
       seenLabels.add(text);
       const lab = el("text", { class: "axis-tick", x: x(t), y: top + h + 18, "text-anchor": "middle" });
       lab.textContent = text;
-      freshSvg.appendChild(lab);
+      svg.appendChild(lab);
     });
 
-    // Endpoint labels: collect target positions first and only place the
-    // text after drawing every line/point, so a collision-avoidance pass can
-    // spread out labels whose values land close together (e.g. a title with
-    // one snapshot puts every source's label at nearly the same y) — drawn
-    // as-is they overlap into unreadable stacked text.
+    // End labels: work out where they go first, and only draw them once
+    // all the lines and points are drawn. That way labels with close values
+    // (e.g. a title with only one snapshot) can be spread apart instead of
+    // piling on top of each other.
     const labelTargets = [];
     present.forEach((s) => {
       const pts = bySource[s].sort((a, b) => a.t - b.t);
@@ -1902,11 +1824,11 @@
       const width = s === SOURCE.PERSONAL ? 3 : 2;
       if (pts.length > 1) {
         const d = pts.map((p, i) => (i === 0 ? "M" : "L") + x(p.t) + " " + y(p.v)).join(" ");
-        freshSvg.appendChild(el("path", { d, fill: "none", stroke: color, "stroke-width": width, "stroke-linecap": "round", "stroke-linejoin": "round" }));
+        svg.appendChild(el("path", { d, fill: "none", stroke: color, "stroke-width": width, "stroke-linecap": "round", "stroke-linejoin": "round" }));
       }
       pts.forEach((p) => {
         const c = el("circle", { cx: x(p.t), cy: y(p.v), r: 4, fill: color, stroke: "var(--surface)", "stroke-width": 1.5, class: "hit" });
-        freshSvg.appendChild(c);
+        svg.appendChild(c);
         wire(c, `<b>${SOURCE_LABEL[s]}</b><br>${new Date(p.t).toISOString().slice(0, 10)} · ${p.v.toFixed(0)}/100`);
       });
       const last = pts[pts.length - 1];
@@ -1919,22 +1841,21 @@
         labelTargets[i].y = labelTargets[i - 1].y + MIN_LABEL_GAP;
       }
     }
-    // The ladder above only pushes down, so 3+ clustered labels can run past
-    // the plot into the date-axis ticks below it — pull the whole stack back
-    // up rather than let the last one collide.
+    // The loop above only pushes labels down, so a cluster of three or more
+    // can run into the date axis. Shift the whole group back up.
     const overflow = labelTargets.length ? labelTargets[labelTargets.length - 1].y - (top + h) : 0;
     if (overflow > 0) labelTargets.forEach((lt) => { lt.y -= overflow; });
     labelTargets.forEach((lt) => {
       const lab = el("text", { class: "bar-label", x: lt.x, y: lt.y + 4 });
       lab.setAttribute("style", "fill:" + lt.color);
       lab.textContent = SOURCE_SHORT_LABEL[lt.source];
-      freshSvg.appendChild(lab);
+      svg.appendChild(lab);
     });
   }
 
-  // Guards against picking a new title before the previous one's history
-  // fetch has resolved — without this, a fast switch away and back can have
-  // the slower, stale response land last and overwrite the correct chart.
+  // Ignores history responses for a title that's no longer selected.
+  // Otherwise switching away and back quickly could let the older, slower
+  // response arrive last and draw the wrong chart.
   let driftRequestId = 0;
   async function loadDrift(imdbId, title) {
     const requestId = ++driftRequestId;
@@ -1987,10 +1908,11 @@
       renderBoxOffice(movies);
       renderYearRuntimeScatter(movies);
       renderLedger(recentMovies);
-      renderInspector(movies, recentMovies[0] ? recentMovies[0].imdb_id : null);
-      renderDriftSelector(movies, recentMovies[0] ? recentMovies[0].imdb_id : null);
+      const latest = recentMovies[0];
+      renderInspector(movies, latest?.imdb_id);
+      renderDriftSelector(movies, latest?.imdb_id);
       document.getElementById("footRefreshNote").textContent =
-        recentMovies[0] ? "last refresh " + fmtDate(recentMovies[0].last_refreshed) : "";
+        latest ? "last refresh " + fmtDate(latest.refreshed) : "";
     } catch (e) {
       if (e.message !== "unauthorized") {
         statusLine.textContent = "connection failed";

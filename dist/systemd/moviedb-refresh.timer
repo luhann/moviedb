@@ -3,9 +3,10 @@ Description=Monthly moviedb OMDB refresh
 
 [Timer]
 OnCalendar=monthly
-# Catch up if the LXC was down at the scheduled moment
+# Run on the next boot if the container was down when it was due
 Persistent=true
-# Don't hit OMDB at exactly midnight on the 1st like everyone else's cron
+# Spread the start out so it doesn't hit OMDB at midnight on the 1st with
+# everyone else's cron jobs
 RandomizedDelaySec=6h
 
 [Install]
