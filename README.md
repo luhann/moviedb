@@ -1,20 +1,26 @@
 # moviedb
 
-This replaces my old moviedb REST API, which ran as three AWS Lambdas. It's
-now a single static Rust binary backed by SQLite, self-hosted on my Proxmox
-cluster.
+moviedb is my personal movie database. It keeps track of every movie I have watched, my own rating for each one, and
+the ratings from IMDb, Rotten Tomatoes and Metacritic — including how those ratings change over time.
 
-The binary has two subcommands:
+The original version was three AWS Lambda functions behind API Gateway, storing movies in DynamoDB. This version is a
+single static Rust binary backed by SQLite, and it runs in an LXC on my Proxmox cluster. The binary has two subcommands:
 
 - `moviedb serve` runs the REST API.
-- `moviedb refresh` pulls updated ratings from [OMDB](https://www.omdbapi.com/)
-  and records the old ones in a `ratings_history` table, so I can track how
-  ratings change over time for every movie I've watched.
+- `moviedb refresh` re-fetches every movie from the [OMDB API](https://www.omdbapi.com/) and records the new ratings in
+  a `ratings_history` table.
+
+A simplified schematic of how it all fits together looks like this:
+
+```
+Traefik -> /movies          -> moviedb serve -> SQLite (and the OMDB API when adding a movie)
+Traefik -> / and /fonts/    -> Caddy -> web/dashboard.html
+systemd timer (monthly)     -> moviedb refresh -> OMDB API -> SQLite
+```
 
 ## API
 
-Every request needs an `x-api-key` header. Every response, including errors,
-is JSON.
+Every request needs an `x-api-key` header, and every response (including errors) is JSON.
 
 ```
 POST /movies   ?title=<title>&rating=<0-100>&year=<2026> fetch from OMDB, store it, snapshot its ratings
@@ -24,29 +30,27 @@ GET  /movies/{imdb_id}                                  one movie
 GET  /movies/{imdb_id}/history                          ratings snapshots, oldest first
 ```
 
-Movies are keyed by IMDb ID, so `/movies/{imdb_id}` is a movie's address.
-Looking a movie up by title and year is a filter on `GET /movies`: it's exact
-and case-sensitive, and it returns a list. Title and year together aren't
-unique, so a filter can match several movies or none, and you get back an
-array either way (possibly empty). Only `/movies/{imdb_id}` returns 404 for a
-missing movie.
+Movies are keyed by their IMDb ID, so `/movies/{imdb_id}` is the address of a movie. Looking a movie up by title and
+year is just a filter on `GET /movies`. The filter is exact and case-sensitive, and because a title and year together
+aren't unique it always returns a list — which might hold several movies, or none at all. Only `/movies/{imdb_id}`
+returns a 404 for a missing movie.
 
-`POST /movies` returns the stored movie. The status is 201 with a `Location`
-header if the movie is new, and 200 if it was already stored.
+`POST /movies` returns the stored movie, with a 201 and a `Location` header if the movie is new, or a 200 if it was
+already stored. POSTing a movie I have already stored is also how I change my rating for it.
 
-A movie is OMDB's data with snake_case keys (`imdb_id`, `imdb_rating`,
-`box_office`), where each entry in `ratings` looks like
-`{"source": ..., "value": ...}`. Two fields are ours: `personal` is your
-score, a whole number from 0 to 100, and `refreshed` is when the movie was
-last fetched from OMDB, by POST or by a refresh. The list endpoints return a
-plain JSON array. `/history` returns an object because it also includes the
-`imdb_id`.
+A movie is OMDB's data with the keys converted to snake_case (`imdb_id`, `imdb_rating`, `box_office`), and each entry
+in `ratings` looks like `{"source": ..., "value": ...}`. On top of that there are two fields of my own: `personal` is
+my rating, a whole number from 0 to 100, and `refreshed` is when the movie was last fetched from OMDB (by either a POST
+or a refresh). The list endpoints return a plain JSON array, while `/history` returns an object since it also includes
+the `imdb_id`.
+
+The full spec is in `openapi.yaml`.
 
 ### Errors
 
-Errors use the [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem
-format (`application/problem+json` with `type`, `title`, `status` and
-`detail`).
+Errors use the [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem format, i.e. `application/problem+json` with
+`type`, `title`, `status` and `detail`. `type` is always `about:blank`, so the status code is what tells you what went
+wrong:
 
 | Status | Meaning |
 |---|---|
@@ -60,52 +64,27 @@ format (`application/problem+json` with `type`, `title`, `status` and
 | 504 | OMDB didn't respond within 10 seconds |
 | 500 | Internal error |
 
-`type` is always `about:blank`; the status code says what went wrong.
-
-The full spec is in `openapi.yaml`.
-
-## Build
+## Building
 
 ```bash
 cargo build --release
-# -> target/x86_64-unknown-linux-musl/release/moviedb  (static-pie, ~5.5MB)
+# -> target/x86_64-unknown-linux-musl/release/moviedb  (static-pie, ~5MB)
 python3 tests/smoke_test.py     # end-to-end check, run before pushing
 ```
 
-The build needs a **nightly** toolchain for now. The cranelift dev profile
-uses `cargo-features = ["codegen-backend"]`, and the target rustflags include
-`-Z threads`. None of the release code depends on nightly, so delete those
-lines if you want a stable build.
+The build currently needs a **nightly** toolchain. The cranelift dev profile uses `cargo-features = ["codegen-backend"]`,
+and the target rustflags include `-Z threads`. None of the release code actually depends on nightly, so if you want a
+stable build you can just delete those lines.
 
-### Create the LXC (on the Proxmox host)
+The smoke test runs the binary against a stub OMDB, so it checks every endpoint end to end without using up any of the
+real OMDB quota.
 
-This step is optional. You can run the binary anywhere; this is just how I
-deploy it.
+## Installing
 
-```bash
-pveam update
-pveam download local debian-12-standard_12.7-1_amd64.tar.zst
-
-pct create 210 local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst \
-  --hostname moviedb \
-  --cores 1 --memory 512 --swap 0 \
-  --rootfs local-lvm:4 \
-  --net0 name=eth0,bridge=vmbr0,ip=dhcp \
-  --unprivileged 1 --features nesting=1 \
-  --onboot 1
-
-pct start 210
-pct enter 210
-```
-
-## Install
-
-This installs the binary and the systemd units. By default `moviedb-refresh`
-runs once a month.
+Copy the binary to `/opt/moviedb/moviedb` and the repo's `dist/` directory into the container, then install the
+config and the systemd units. By default `moviedb-refresh` runs once a month.
 
 ```bash
-mkdir -p /opt/moviedb
-
 cp dist/moviedb.env.example /etc/moviedb.env
 chmod 600 /etc/moviedb.env
 # edit /etc/moviedb.env: set API_KEY (openssl rand -hex 32) and OMDB_KEY
@@ -114,118 +93,98 @@ cp dist/systemd/* /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now moviedb moviedb-refresh.timer
 systemctl status moviedb
-systemd-analyze security moviedb   # exposure score, expect ~1.x
+systemd-analyze security moviedb   # exposure score, mine is 1.6
 ```
 
-For later deploys from a workstation, `scripts/deploy.sh` builds, runs the
-smoke test, pushes the binary into the container and restarts the service.
+After that, I deploy from my workstation with `scripts/deploy.sh`. It builds the binary, runs the smoke test, pushes
+the binary into the container and restarts the service.
+
+## Refreshing
+
+`moviedb refresh [db_path]` re-fetches every movie from OMDB by its IMDb ID. It only ever replaces OMDB's data, and
+never touches my rating.
+
+OMDB limits you to 1000 requests a day, so a refresh works through the movies that were refreshed longest ago
+first. Both a POST and a refresh record when a movie was last fetched, which means a run that gets cut short by the
+daily limit simply picks up where it left off next time. Hitting the limit ends the run cleanly (exit 0).
+
+A timeout or a bad response skips that movie, and the run exits non-zero at the end. Three failures in a row, a
+rejected API key or an OMDB error it doesn't recognise all stop the run immediately, also with a non-zero exit.
+`--dry-run` prints the rating changes without writing anything, and `--sleep` sets the pause between requests
+(0.5s by default).
+
+`moviedb-refresh.timer` runs the refresh monthly in the same sandbox as the API, and the logs go to
+`journalctl -u moviedb-refresh`. To run it now, use `systemctl start moviedb-refresh`.
+
+**Don't run a real refresh directly as root.** SQLite would create the WAL and SHM files owned by root, and the
+service's dynamic user can't replace them. If you need extra flags, run it inside the unit's sandbox instead:
+
+```bash
+systemd-run --wait --pty -p DynamicUser=yes -p User=moviedb -p StateDirectory=moviedb \
+  -p EnvironmentFile=/etc/moviedb.env /opt/moviedb/moviedb refresh --dry-run
+```
+
+## Backups
+
+`/var/lib/moviedb/movies.db` is the whole dataset, so back up either the container or just that file. The database is
+in WAL mode, which means copying the file while the service is running might not give you a consistent copy. Use
+`sqlite3 movies.db ".backup backup.db"` instead.
 
 ## Dashboard
 
-`web/dashboard.html` is a single-file dashboard for the API. It's a static
-file with no build step.
+`web/dashboard.html` is a single-file dashboard for the API. It's just a static file, with no build step.
 
-`scripts/deploy.sh` ships the page and `web/fonts/` after the API has
-restarted, so if the binary deploy fails the old page stays up.
-`scripts/deploy.sh --web-only` ships just the page and fonts without touching
-the API.
+It uses my [patroclus](https://github.com/luhann/patroclus) theme. The token block at the top of the file is the same
+one my other sites use, plus two values they don't need (the meta accent and the shadow), so you can diff it against
+patroclus's `design.yaml`. Dark mode is the default. The toggle in the header switches to light mode, and the choice is
+remembered in `localStorage` under `theme_pref_v2`.
 
-The fonts are self-hosted rather than loaded from a CDN, so **`fonts/` has to
-be deployed alongside the page**. Without it the page still loads, but falls
-back to system fonts.
+I serve it with Caddy's `file_server`, and the page is installed as `index.html`. The fonts are self-hosted rather
+than loaded from a CDN, so **`fonts/` has to be deployed alongside the page**. Without it the page still loads, but
+falls back to system fonts.
 
-It uses the [patroclus](https://github.com/luhann/patroclus) theme. The token
-block at the top of the file is the same one my other sites use, plus two
-values they don't need (the meta accent and the shadow), so you can diff it
-against patroclus's `design.yaml`. Dark mode is the default. Light mode is
-switched on with the toggle in the header and remembered in `localStorage`
-under `theme_pref_v2`.
+`scripts/deploy.sh` ships the page and `web/fonts/` once the API has restarted, so if the binary deploy fails the old
+page stays up. `scripts/deploy.sh --web-only` ships just the page and fonts, without touching the API. Unlike the
+binary, the page is copied straight to the container over ssh (`WEB_HOST=`, `root@omdb.trusted` by default) rather than
+through the Proxmox host. If your Caddy root and port differ from mine, set `WEB_ROOT=` and `WEB_PORT=`.
 
-I serve it with Caddy's `file_server`. The page is copied straight to that
-container over ssh (`WEB_HOST=`, default `root@omdb.trusted`) instead of
-through the Proxmox host like the binary. Set `WEB_ROOT=` and `WEB_PORT=` if
-your Caddy root and port differ from the defaults. The page is installed as
-`index.html`.
-
-After copying, the script checks the page's checksum on the container, then
-requests the page and every font from Caddy directly and again through
-`PUBLIC_URL=` (default `https://omdb.luhann.com`; set it empty to skip). A
-font that didn't make it fails the deploy.
-
-To push by hand instead:
-
-```bash
-pct exec 401 -- mkdir -p /opt/moviedb/web/fonts   # pct push won't create it
-pct push 401 web/dashboard.html /opt/moviedb/web/index.html --perms 0644
-for f in web/fonts/*.woff2; do
-    pct push 401 "$f" "/opt/moviedb/web/fonts/$(basename "$f")" --perms 0644
-done
-```
+After copying, the script checks the page's checksum on the container. It then requests the page and every font from
+Caddy directly, and again through `PUBLIC_URL=` (`https://omdb.luhann.com` by default, or set it empty to skip). If a
+font didn't make it, the deploy fails.
 
 ## Routing
 
-Up to you. I use [traefik](https://github.com/traefik/traefik) as a reverse
-proxy, but anything that can reach the API works.
+This is up to you. I use [Traefik](https://github.com/traefik/traefik) as a reverse proxy, but anything that can reach
+the API will work.
 
 ## Upgrading to 3.0
 
-3.0 changed the database schema. Only the `v3.0.0` tag can migrate a 2.x
-database: run its `moviedb serve` against the database once, then upgrade.
-Later versions don't include the migration. After migrating, a 2.x binary
-can no longer use the database, so back it up first (see Backups below). The
-API changes in 3.0 were:
+3.0 changed the database schema, and only the `v3.0.0` tag can migrate a 2.x database. To upgrade, run that tag's
+`moviedb serve` against the database once, then move to the latest version. Later versions don't include the
+migration. Once migrated, a 2.x binary can no longer use the database, so take a backup first (see
+[Backups](#backups)).
 
-- Your rating is a top-level `personal` number instead of a `Personal` entry
-  in `ratings`, which now holds only OMDB's ratings. `rating=` on POST must
-  be a whole number from 0 to 100.
-- `_refreshed` is now `refreshed`. `/movies/recent` sorts by it and no
-  longer adds a `last_refreshed` field (it always had the same value).
-- A refresh no longer repeats your rating in the history, so `Personal`
-  snapshots record when you rated.
-- The 503 for running out of database capacity is gone. A request waits for
-  the database instead.
-- Every error's `type` is `about:blank`. The quota 503 used to have its own
-  URN.
+The API changes in 3.0 were:
 
-## Changes from the Lambda version
+- My rating is now a top-level `personal` number, rather than a `Personal` entry in `ratings`. `ratings` now only
+  holds OMDB's ratings, and `rating=` on POST must be a whole number from 0 to 100.
+- `_refreshed` is now `refreshed`. `/movies/recent` sorts by it, and no longer adds a `last_refreshed` field (it always
+  had the same value anyway).
+- A refresh no longer repeats my rating in the history, so `Personal` snapshots now record when I actually rated a
+  movie.
+- The 503 for running out of database capacity is gone. A request now waits for the database instead.
+- Every error's `type` is `about:blank`. The quota 503 used to have its own URN.
 
-- **Movies are keyed by `imdb_id`** instead of DynamoDB's (title, year). If
-  OMDB corrects a title, POSTing it again no longer creates a duplicate.
-  Title/year lookup still works as a filter on `GET /movies`.
-- **POST returns the stored movie as JSON** (201 with `Location` if new, 200
-  if it already existed). The Lambda returned the bare title as plain text.
-- **`year` is required on POST.** The Lambda threw a KeyError (502) without
-  it; this returns a 422.
-- **No trailing slashes.** `/movies/` is a 404, not a redirect to `/movies`.
-  The FastAPI version returned a 307, which `curl -L` followed without
-  complaint. Fix the URL rather than the router.
-- **Ratings history.** Every POST adds a row to `ratings_history` for your
-  rating and each of OMDB's, and every refresh adds one for each of OMDB's. The migration seeded one snapshot per movie,
-  stamped with the migration time, but those ratings were fetched at some
-  earlier, unrecorded date. Read the first snapshot for each movie as
-  "correct as of the migration at the latest".
-- **Refreshing.** `moviedb refresh [db_path]` re-fetches every movie by IMDb
-  ID. It only replaces OMDB's data, never your rating.
-  - It works through the movies that were refreshed longest ago first, and
-    both POST and refresh record when each movie was last fetched. That means
-    a run cut short by OMDB's 1000-requests-a-day limit picks up where it left
-    off next time.
-  - Hitting the daily limit ends the run cleanly (exit 0).
-  - A timeout or bad response skips that movie, and the run exits non-zero at
-    the end. Three failures in a row, a rejected API key or an unknown OMDB
-    error stop the run immediately, also non-zero.
-  - `--dry-run` prints the rating changes without writing anything. `--sleep`
-    sets the pause between requests (default 0.5s).
+## Changes From the Lambda Version
 
-  `moviedb-refresh.timer` runs it monthly under the same sandbox as the API,
-  and logs go to `journalctl -u moviedb-refresh`. To run it now:
-  `systemctl start moviedb-refresh`.
-
-  **Don't run a real refresh directly as root.** SQLite would create WAL/SHM
-  files owned by root, which the service's dynamic user can't replace. If you
-  need extra flags, run it inside the unit's sandbox:
-  `systemd-run --wait --pty -p DynamicUser=yes -p User=moviedb -p StateDirectory=moviedb -p EnvironmentFile=/etc/moviedb.env /opt/moviedb/moviedb refresh --dry-run`.
-- **Backups.** `/var/lib/moviedb/movies.db` is the whole dataset, so back up
-  the container or just that file. The database is in WAL mode, so use
-  `sqlite3 movies.db ".backup backup.db"` to get a consistent copy rather
-  than copying the file while the service is running.
+- Movies are keyed by `imdb_id` instead of DynamoDB's (title, year). If OMDB corrects a title, POSTing the movie again
+  no longer creates a duplicate. Looking a movie up by title and year still works as a filter on `GET /movies`.
+- POST returns the stored movie as JSON (201 with `Location` if it's new, 200 if it already existed). The Lambda
+  returned the bare title as plain text.
+- `year` is required on POST. Without it the Lambda threw a KeyError (502); this returns a 422.
+- There are no trailing slashes. `/movies/` is a 404, not a redirect to `/movies`. The FastAPI version returned a 307,
+  which `curl -L` happily followed without complaint.
+- There is now a ratings history. Every POST adds a row to `ratings_history` for my rating and each of OMDB's, and
+  every refresh adds one for each of OMDB's. When I first moved off the Lambdas, the migration seeded one snapshot per
+  movie, stamped with the migration time. Of course, those ratings were actually fetched at some earlier (unrecorded)
+  date, so the first snapshot for each of those movies should be read as "correct as of the migration, at the latest".

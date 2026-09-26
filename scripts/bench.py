@@ -62,14 +62,24 @@ connections):
   req/s. A body 4x smaller that isn't any faster rules bandwidth out.
   --accept-encoding is there so you can check this again.
 
-3.0 replaced the pool with one connection. Measured locally on 2026-09-26,
-server pinned to 2 cores, same 184 seeded rows, req/s at concurrency 1/8/32:
+2.3 against 3.0, measured locally on 2026-09-26 with the server pinned to 2
+cores and the same 222 seeded movies. req/s at concurrency 1 / 8 / 32:
 
-    GET /movies            pool  4.7k / 16.2k / 15.0k    one  5.0k / 12.4k / 12.8k
-    GET /movies/tt0000001  pool  8.7k / 53.5k / 65.3k    one  9.0k / 48.4k / 50.1k
+                                2.3 (8-connection pool)    3.0 (one connection)
+    GET /movies                 4.6k / 15.2k / 14.2k       1.4k / 1.8k / 1.8k
+    GET /movies/tt0000001       8.2k / 54.0k / 67.8k       7.1k / 23.2k / 21.4k
+    GET /movies/recent?limit=50 1.1k /  1.0k /  1.0k       3.1k / 5.2k / 5.3k
+    GET /movies/{id}/history    7.8k / 52.3k / 67.1k       8.6k / 41.5k / 40.8k
 
-So one connection costs about 20% at high concurrency and nothing for a
-single client, which is the only load this service sees.
+- One connection costs 20-40% at high concurrency and nothing for a single
+  client, which is the only load this service sees.
+- GET /movies is slower because every doc now gets `personal` and
+  `refreshed` appended by the movie_docs view (0.7ms instead of 0.2ms per
+  request). Building the docs with json_set instead was 7x slower than 2.3.
+  Appending in Rust would get most of it back; for one user it isn't worth
+  it.
+- GET /movies/recent is faster because it reads an index instead of running
+  a subquery per movie.
 
 
 Memory
@@ -85,14 +95,18 @@ idle baseline of 15MB (on a server that hadn't served anything yet):
 These were measured with the 8-connection pool in 2.x. Memory stopped
 growing from concurrency 8 onwards (39/105/118/136/136 MB at 4/8/16/32/64 on
 the 2000-row table), because only 8 requests could build a response at once.
-With one connection only one builds at a time, so expect lower peaks; this
-hasn't been re-measured. The peak was still well above what was actually in
-use, because RSS includes memory the allocator keeps hold of. That's why a
-guess of "about 8x the table" was out by about a factor of six.
+The peak was still well above what was actually in use, because RSS includes
+memory the allocator keeps hold of. That's why a guess of "about 8x the
+table" was out by about a factor of six.
+
+3.0 builds one response at a time. In the comparison above (222 rows, RSS
+sampled every 50ms) the peak across all four endpoints was 33-43MB, against
+68-151MB for 2.3.
 
 Growth isn't linear in table size either: 10x the rows only doubled it,
 because most of it is fixed per-connection and allocator overhead. From the
-two points above, the limit is somewhere around 5k rows. To get the real
+two points above, the 2.x limit was somewhere around 5k rows; 3.0's should
+be higher, but that hasn't been measured. To get the real
 number for a given table, sample RSS while you run the sweep:
     while :; do awk '/VmRSS/{print $2}' /proc/$(pgrep -x moviedb)/status; sleep 0.2; done
 
