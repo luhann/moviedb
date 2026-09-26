@@ -169,12 +169,11 @@ proxy, but anything that can reach the API works.
 
 ## Upgrading to 3.0
 
-3.0 changes the database schema, and `moviedb serve` migrates it the first
-time it starts. If any stored Personal rating isn't a whole number from 0 to
-100, the migration changes nothing, lists those movies and the server
-doesn't start. After a migration, a 2.x binary can no longer use the
-database, so take a backup first (see Backups below) if you might want to
-roll back. The API changes are:
+3.0 changed the database schema. Only the `v3.0.0` tag can migrate a 2.x
+database: run its `moviedb serve` against the database once, then upgrade.
+Later versions don't include the migration. After migrating, a 2.x binary
+can no longer use the database, so back it up first (see Backups below). The
+API changes in 3.0 were:
 
 - Your rating is a top-level `personal` number instead of a `Personal` entry
   in `ratings`, which now holds only OMDB's ratings. `rating=` on POST must
